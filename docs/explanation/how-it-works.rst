@@ -277,8 +277,9 @@ learn what was built.
 ``--report`` writes this information to a JSON file. It uses a file rather than ``stdout`` because the build backend
 runs as a subprocess that inherits build's streams and may print to them, so a consumer could not separate the report
 from backend chatter on ``stdout``. A file build controls keeps the machine-readable output apart from the human- and
-backend-facing log. Build writes the report only after the build succeeds and replaces it atomically, so a consumer
-never reads a half-written file. See :ref:`build-report` for the schema.
+backend-facing log. Artifacts are recorded as their hooks succeed, so the report reflects only the current invocation
+even if a later hook fails; build replaces the report atomically, so a consumer never reads a half-written file. See
+:ref:`build-report` for the schema.
 
 ****************************
  Performance Considerations

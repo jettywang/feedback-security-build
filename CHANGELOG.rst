@@ -1,4 +1,17 @@
 ####################
+ Unreleased
+####################
+
+**********
+ Bugfixes
+**********
+
+- When a build hook fails after another hook has already produced an artifact, the ``--report`` file is still written
+  and lists only the artifacts whose hook succeeded in the current invocation; files already present in the output
+  directory are never attributed to the run. Outputs the failed hook left behind are removed, while pre-existing
+  entries (including a wheel with the expected name) are kept so they can be verified separately.
+
+####################
  1.6.1 (2026-09-10)
 ####################
 

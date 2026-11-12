@@ -5,6 +5,7 @@ from __future__ import annotations
 
 __lazy_modules__ = {
     'difflib',
+    'shutil',
     'subprocess',
     'tomllib',
     'warnings',
@@ -17,6 +18,7 @@ __lazy_modules__ = {
 import contextlib
 import difflib
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -403,10 +405,41 @@ class ProjectBuilder:
             msg = f"Build path '{outdir}' does not exist and cannot be a directory"
             raise BuildException(msg) from None
 
-        with self._handle_backend(hook_name):
-            basename: str = callback(outdir, config_settings, **kwargs)
+        # Snapshot the output directory so a failed hook cannot leave partial
+        # artifacts behind that look like outputs of this build. Entries that
+        # already existed before the call are kept untouched.
+        before = self._snapshot_outdir(outdir)
+        try:
+            with self._handle_backend(hook_name):
+                basename: str = callback(outdir, config_settings, **kwargs)
+        except BaseException:
+            self._cleanup_failed_hook(outdir, before)
+            raise
 
         return os.path.join(outdir, basename)
+
+    @staticmethod
+    def _snapshot_outdir(outdir: str) -> set[str]:
+        try:
+            return set(os.listdir(outdir))
+        except OSError:
+            return set()
+
+    @staticmethod
+    def _cleanup_failed_hook(outdir: str, before: set[str]) -> None:
+        try:
+            entries = os.listdir(outdir)
+        except OSError:
+            return
+        for name in entries:
+            if name in before:
+                continue
+            path = os.path.join(outdir, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
 
     @contextlib.contextmanager
     def _handle_backend(self, hook: str) -> Generator[None]:

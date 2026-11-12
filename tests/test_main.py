@@ -1475,6 +1475,76 @@ def test_write_report_creates_parent_directory(tmp_path: pathlib.Path, built_dis
     assert report.is_file()
 
 
+def test_report_excludes_preexisting_artifacts(
+    tmp_path: pathlib.Path, package_test_partial_wheel: str
+) -> None:
+    # A wheel left by an earlier build must not be attributed to this run, even
+    # though it sits in the same output directory; it stays on disk for separate
+    # verification instead.
+    outdir = tmp_path / 'dist'
+    outdir.mkdir()
+    stale_wheel = outdir / 'test_partial_wheel-0.9.0-py3-none-any.whl'
+    stale_wheel.write_bytes(b'wheel from a previous build')
+    report = tmp_path / 'report.json'
+
+    build.__main__.main(
+        [package_test_partial_wheel, '-n', '-x', '-o', str(outdir), '--report', str(report)]
+    )
+
+    payload = cast(BuildReport, json.loads(report.read_text(encoding='utf-8')))
+    names = [artifact['name'] for artifact in payload['artifacts']]
+    assert names == [
+        'test_partial_wheel-1.0.0.tar.gz',
+        'test_partial_wheel-1.0.0-py3-none-any.whl',
+    ]
+    assert stale_wheel.name not in names
+    assert stale_wheel.is_file()
+    assert {path.name for path in outdir.iterdir()} == {
+        'test_partial_wheel-1.0.0.tar.gz',
+        'test_partial_wheel-1.0.0-py3-none-any.whl',
+        stale_wheel.name,
+    }
+
+
+def test_report_on_partial_failure_lists_only_completed_hooks(
+    tmp_path: pathlib.Path, package_test_partial_wheel: str
+) -> None:
+    # The sdist hook succeeds and the wheel hook then fails after dropping a
+    # partial file. The report must still be written, list only the sdist, and
+    # neither swallow the partial output nor touch the pre-existing wheel.
+    outdir = tmp_path / 'dist'
+    outdir.mkdir()
+    stale_wheel = outdir / 'test_partial_wheel-0.9.0-py3-none-any.whl'
+    stale_wheel.write_bytes(b'wheel from a previous build')
+    report = tmp_path / 'report.json'
+    report.write_text('{"stale": true}', encoding='utf-8')
+
+    with pytest.raises(SystemExit):
+        build.__main__.main(
+            [
+                package_test_partial_wheel,
+                '-n',
+                '-x',
+                '-o',
+                str(outdir),
+                '--report',
+                str(report),
+                '-Cfail-wheel=1',
+            ]
+        )
+
+    payload = cast(BuildReport, json.loads(report.read_text(encoding='utf-8')))
+    assert [artifact['name'] for artifact in payload['artifacts']] == [
+        'test_partial_wheel-1.0.0.tar.gz'
+    ]
+    remaining = {path.name for path in outdir.iterdir()}
+    assert remaining == {
+        'test_partial_wheel-1.0.0.tar.gz',
+        stale_wheel.name,
+    }
+    assert stale_wheel.read_bytes() == b'wheel from a previous build'
+
+
 def test_report_not_allowed_with_metadata(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         build.__main__.main(['--report', 'r.json', '--metadata'])

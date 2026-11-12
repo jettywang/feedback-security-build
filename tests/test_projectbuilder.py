@@ -403,6 +403,54 @@ def test_build(mocker: pytest_mock.MockerFixture, package_test_flit: str, tmp_di
         builder.build('wheel', tmp_dir)
 
 
+def test_failed_hook_cleans_only_new_outputs(
+    mocker: pytest_mock.MockerFixture, package_test_flit: str, tmp_dir: str
+) -> None:
+    hook = mocker.patch('pyproject_hooks.BuildBackendHookCaller', autospec=True).return_value
+
+    def leave_partial_file(outdir: str, config_settings: object) -> str:
+        pathlib.Path(outdir, 'partial.whl').write_bytes(b'partial')
+        pathlib.Path(outdir, 'scratch').mkdir()
+        pathlib.Path(outdir, 'scratch', 'note.txt').write_text('temp')
+        msg = 'hook exploded'
+        raise RuntimeError(msg)
+
+    hook.build_wheel.side_effect = leave_partial_file
+    builder = build.ProjectBuilder(package_test_flit)
+    existing = pathlib.Path(tmp_dir, 'already-there.whl')
+    existing.write_bytes(b'from a previous build')
+
+    with pytest.raises(build.BuildBackendException, match='hook exploded'):
+        builder.build('wheel', tmp_dir)
+
+    assert existing.read_bytes() == b'from a previous build'
+    assert not pathlib.Path(tmp_dir, 'partial.whl').exists()
+    assert not pathlib.Path(tmp_dir, 'scratch').exists()
+
+
+def test_failed_hook_keeps_outputs_written_before_failure(
+    mocker: pytest_mock.MockerFixture, package_test_flit: str, tmp_dir: str
+) -> None:
+    hook = mocker.patch('pyproject_hooks.BuildBackendHookCaller', autospec=True).return_value
+
+    def overwrite_then_fail(outdir: str, config_settings: object) -> str:
+        # The hook rewrites a file that already existed; cleanup must not delete
+        # the pre-existing entry just because the hook touched its directory.
+        pathlib.Path(outdir, 'same-name.whl').write_bytes(b'new partial bytes')
+        msg = 'hook exploded'
+        raise RuntimeError(msg)
+
+    hook.build_wheel.side_effect = overwrite_then_fail
+    builder = build.ProjectBuilder(package_test_flit)
+    same_name = pathlib.Path(tmp_dir, 'same-name.whl')
+    same_name.write_bytes(b'previous good wheel')
+
+    with pytest.raises(build.BuildBackendException, match='hook exploded'):
+        builder.build('wheel', tmp_dir)
+
+    assert same_name.is_file()
+
+
 def test_default_backend(mocker: pytest_mock.MockerFixture, package_legacy: str) -> None:
     mocker.patch('pyproject_hooks.BuildBackendHookCaller', autospec=True)
 

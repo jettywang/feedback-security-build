@@ -73,7 +73,11 @@ At normal verbosity, isolated builds also print the installed versions of declar
  Build Report
 **************
 
-``--report PATH`` writes a JSON description of the built artifacts to ``PATH`` after a successful build.
+``--report PATH`` writes a JSON description of the built artifacts to ``PATH`` after a build. Each artifact is added
+the moment its build hook succeeds, so if a later hook fails the report is still written with only the artifacts
+completed in this invocation. A failing hook's partial output is removed from the output directory, while files that
+were already there before the build are left untouched and never appear in the report, so a stale wheel from a previous
+run can be verified independently instead of being mistaken for a current artifact.
 
 .. code-block:: console
 

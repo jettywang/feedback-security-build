@@ -102,6 +102,27 @@ _NO_COLORS = dict.fromkeys(_COLORS, '')
 _DEFAULT_STYLES = {'stdout': _COLORS, 'stderr': _COLORS}
 _styles = contextvars.ContextVar('_styles', default=_DEFAULT_STYLES)
 
+# Basenames of artifacts whose build hook has returned successfully during the
+# current invocation. A later failing hook leaves the earlier entries intact so
+# the report can attribute only genuinely built artifacts to this run.
+_built_artifacts: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar('_built_artifacts', default=None)
+
+
+def _record_artifact(name: str) -> None:
+    artifacts = _built_artifacts.get()
+    if artifacts is not None:
+        artifacts.append(name)
+
+
+@contextlib.contextmanager
+def _collect_artifacts() -> Generator[list[str]]:
+    artifacts: list[str] = []
+    token = _built_artifacts.set(artifacts)
+    try:
+        yield artifacts
+    finally:
+        _built_artifacts.reset(token)
+
 
 def _init_colors() -> None:
     match os.environ:
@@ -266,7 +287,9 @@ def _build(
         env_dir,
         pyproject_hooks.quiet_subprocess_runner if _ctx.verbosity < 0 else None,
     ) as builder:
-        return builder.build(distribution, outdir, config_settings)
+        artifact = builder.build(distribution, outdir, config_settings)
+    _record_artifact(os.path.basename(artifact))
+    return artifact
 
 
 @contextlib.contextmanager
@@ -731,14 +754,27 @@ def main(cli_args: Sequence[str], prog: str | None = None) -> None:
     else:
         outdir = os.path.join(args.srcdir, 'dist')
 
-    with _handle_build_error(env_dir=args.env_dir, sdist_extract_dir=args.sdist_extract_dir):
-        if sdist_input:
-            with _extract_sdist(args.srcdir, extract_dir=args.sdist_extract_dir) as extracted_srcdir:
-                built = run_build(extracted_srcdir, outdir)
-        else:
-            built = run_build(args.srcdir, outdir)
-        if args.report is not None:
-            _write_report(args.report, outdir, built)
+    # Artifacts are recorded as each hook succeeds, so a later failing hook still
+    # leaves the earlier, genuinely built artifacts available for the report.
+    built: list[str] = []
+    with (
+        _handle_build_error(env_dir=args.env_dir, sdist_extract_dir=args.sdist_extract_dir),
+        _collect_artifacts() as artifacts,
+    ):
+        try:
+            if sdist_input:
+                with _extract_sdist(args.srcdir, extract_dir=args.sdist_extract_dir) as extracted_srcdir:
+                    built = run_build(extracted_srcdir, outdir)
+            else:
+                built = run_build(args.srcdir, outdir)
+        finally:
+            # Write the report even when a later hook fails: the list only
+            # holds artifacts returned by successful hooks of this invocation,
+            # never pre-existing files in the output directory.
+            if args.report is not None:
+                # When the build entry point is mocked in tests it does not
+                # populate the context, so fall back to its returned names.
+                _write_report(args.report, outdir, artifacts or built)
         if _ctx.verbosity >= -1 and built:
             artifact_list = _natural_language_list(
                 ['{underline}{}{reset}{bold}{green}'.format(artifact, **_styles.get()['stdout']) for artifact in built]
