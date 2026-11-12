@@ -21,6 +21,8 @@ __lazy_modules__ = {
 
 import abc
 import contextlib
+import dataclasses
+import enum
 import functools
 import importlib.metadata
 import importlib.util
@@ -39,7 +41,7 @@ from packaging.utils import canonicalize_name
 
 from . import _ctx
 from ._ctx import run_subprocess
-from ._exceptions import BuildException, FailedProcessError
+from ._exceptions import BuildException, FailedProcessError, InstallerPrecheckError
 from ._util import check_dependency
 
 
@@ -58,6 +60,231 @@ INSTALLERS: tuple[Installer, ...] = typing.get_args(Installer)
 
 # Match the ``venv`` CLI default. Symlinked interpreters on Windows can fail, see #1175.
 _USE_SYMLINKS = os.name != 'nt'
+
+
+class SettingStatus(enum.Enum):
+    """How the selected installer treats an active environment setting."""
+
+    HONORED = 'honored'
+    UNHONORED = 'unhonored'
+    UNSUPPORTED = 'unsupported'
+
+
+@dataclasses.dataclass(frozen=True)
+class _SettingSpec:
+    """
+    How the uv installer treats a pip-era environment variable.
+
+    :param uv_equivalent: the ``UV_*`` variable carrying the same meaning, when a one-to-one mapping exists
+    :param reason: explanation shown when the setting cannot be carried over as-is
+    """
+
+    uv_equivalent: str | None = None
+    reason: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class SettingCheck:
+    """The result of evaluating one active environment variable against the selected installer."""
+
+    name: str
+    value: str
+    status: SettingStatus
+    detail: str
+
+    @property
+    def blocks(self) -> bool:
+        """Whether the setting stops the migration until it is reconfigured."""
+        return self.status is not SettingStatus.HONORED
+
+
+@dataclasses.dataclass(frozen=True)
+class InstallerPrecheckReport:
+    """
+    The outcome of :func:`installer_precheck` for the selected installer.
+
+    :param installer: the installer that was evaluated
+    :param checks: one entry per environment variable that was active and is relevant to dependency installation
+    :param constraints_txt_path: the constraints file that will be passed through, if any
+    """
+
+    installer: Installer
+    checks: tuple[SettingCheck, ...]
+    constraints_txt_path: str | None
+
+    @property
+    def blocking(self) -> tuple[SettingCheck, ...]:
+        """Settings the installer cannot honour, in the order they were discovered."""
+        return tuple(check for check in self.checks if check.blocks)
+
+    @property
+    def ok(self) -> bool:
+        """Whether every active setting is honoured by the selected installer."""
+        return not self.blocking
+
+    def raise_if_unsupported(self) -> None:
+        """Raise :class:`InstallerPrecheckError` when an active setting cannot be honoured."""
+        if self.blocking:
+            lines = '\n'.join(f'- {check.name}: {check.detail}' for check in self.blocking)
+            installer = self.installer
+            msg = (
+                f'{len(self.blocking)} active pip-era setting(s) are not honoured by the {installer} installer; '
+                f'reconfigure the environment before switching installers:\n{lines}'
+            )
+            raise InstallerPrecheckError(installer, msg)
+
+    def format(self) -> str:
+        """Render a human-readable summary, one setting per line."""
+        if not self.checks:
+            body = '- no active installer-specific environment settings detected'
+        else:
+            body = '\n'.join(
+                f'- [{check.status.value}] {check.name}={check.value}: {check.detail}' for check in self.checks
+            )
+        constraints = self.constraints_txt_path or '(none)'
+        return f'installer precheck for {self.installer!r} (constraints: {constraints})\n{body}'
+
+
+# pip-specific settings carried by environment variables, and how uv treats them.
+# Only settings that influence index access, network/TLS policy or dependency resolution are listed.
+_UV_SETTING_SPECS: dict[str, _SettingSpec] = {
+    'PIP_INDEX_URL': _SettingSpec(
+        uv_equivalent='UV_INDEX_URL',
+        reason='uv does not read PIP_INDEX_URL; set UV_INDEX_URL to the same private index',
+    ),
+    'PIP_EXTRA_INDEX_URL': _SettingSpec(
+        uv_equivalent='UV_EXTRA_INDEX_URL',
+        reason='uv does not read PIP_EXTRA_INDEX_URL; set UV_EXTRA_INDEX_URL instead',
+    ),
+    'PIP_CERT': _SettingSpec(
+        reason='uv has no PIP_CERT equivalent; install the CA certificate into the native store with UV_NATIVE_TLS=1 '
+        'or rely on SSL_CERT_FILE',
+    ),
+    'PIP_TRUSTED_HOST': _SettingSpec(
+        uv_equivalent='UV_INSECURE_HOST',
+        reason='uv does not read PIP_TRUSTED_HOST; allow the host with UV_INSECURE_HOST (prefer a trusted CA instead)',
+    ),
+    'PIP_CONSTRAINT': _SettingSpec(
+        uv_equivalent='UV_CONSTRAINT',
+        reason='uv does not read PIP_CONSTRAINT; set UV_CONSTRAINT or pass --dependency-constraints-txt',
+    ),
+    'PIP_TIMEOUT': _SettingSpec(
+        uv_equivalent='UV_HTTP_TIMEOUT',
+        reason='uv does not read PIP_TIMEOUT; set UV_HTTP_TIMEOUT (seconds) instead',
+    ),
+    'PIP_NO_CACHE_DIR': _SettingSpec(
+        uv_equivalent='UV_NO_CACHE',
+        reason='uv does not read PIP_NO_CACHE_DIR; set UV_NO_CACHE=1 to disable caching',
+    ),
+    'PIP_RETRIES': _SettingSpec(
+        reason='uv does not expose a pip-style retry count; remove the override and rely on uv defaults',
+    ),
+    'PIP_REQUIRE_VIRTUALENV': _SettingSpec(
+        reason='uv targets the build environment explicitly via --python; the require-virtualenv guard has no '
+        'equivalent and must be unset',
+    ),
+    'PIP_CONFIG_FILE': _SettingSpec(
+        reason='uv does not read pip configuration files; migrate index/cert settings to UV_* variables or uv.toml',
+    ),
+}
+
+# Generic, installer-agnostic variables read by both pip and uv (and the TLS libraries underneath them).
+_HONORED_ENV_VARS: frozenset[str] = frozenset(
+    {
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'NO_PROXY',
+        'ALL_PROXY',
+        'SSL_CERT_FILE',
+        'SSL_CERT_DIR',
+        'REQUESTS_CA_BUNDLE',
+    }
+)
+
+
+def _redact_url(value: str) -> str:
+    """Mask embedded credentials in a URL so they never appear in precheck output."""
+    if '://' not in value or '@' not in value.split('://', 1)[1]:
+        return value
+    scheme, rest = value.split('://', 1)
+    _credentials, _, host = rest.partition('@')
+    return f'{scheme}://***:***@{host}'
+
+
+def _evaluate_uv_setting(name: str, value: str, environ: Mapping[str, str]) -> SettingCheck:
+    upper_name = name.upper()
+    redacted = _redact_url(value)
+
+    if upper_name in _HONORED_ENV_VARS:
+        return SettingCheck(
+            name=upper_name,
+            value=redacted,
+            status=SettingStatus.HONORED,
+            detail='generic network/TLS variable, read natively by uv',
+        )
+
+    spec = _UV_SETTING_SPECS[upper_name]
+    active_upper = {key.upper(): key for key in environ if environ[key]}
+
+    if spec.uv_equivalent is not None and spec.uv_equivalent in active_upper:
+        return SettingCheck(
+            name=upper_name,
+            value=redacted,
+            status=SettingStatus.HONORED,
+            detail=f'uv equivalent {spec.uv_equivalent} is already set; the PIP_* value is otherwise ignored',
+        )
+
+    return SettingCheck(
+        name=upper_name,
+        value=redacted,
+        status=SettingStatus.UNSUPPORTED if spec.uv_equivalent is None else SettingStatus.UNHONORED,
+        detail=spec.reason,
+    )
+
+
+def installer_precheck(
+    installer: Installer,
+    *,
+    environ: Mapping[str, str] | None = None,
+    constraints_txt_path: _types.StrPath | None = None,
+) -> InstallerPrecheckReport:
+    """
+    Check whether the selected installer supports the active build configuration.
+
+    Inspects the environment for pip-era index access restrictions and build dependency constraints that the
+    requested installer must be able to honour. With ``installer='pip'`` every relevant setting is honoured as-is.
+    With ``installer='uv'``, pip-specific variables are only accepted when their uv equivalent is already
+    configured; otherwise the returned report marks them as blocking.
+
+    :param installer: the installer that will create the build environment
+    :param environ: environment mapping to inspect (defaults to :data:`os.environ`)
+    :param constraints_txt_path: constraints file that will be forwarded to the installer
+    :return: a report describing each relevant active setting and whether it is honoured
+    """
+    env = os.environ if environ is None else environ
+    recognized = frozenset(_UV_SETTING_SPECS) | _HONORED_ENV_VARS
+
+    checks: list[SettingCheck] = []
+    for name, value in env.items():
+        if not value or name.upper() not in recognized:
+            continue
+        if installer == 'pip':
+            checks.append(
+                SettingCheck(
+                    name=name.upper(),
+                    value=_redact_url(value),
+                    status=SettingStatus.HONORED,
+                    detail='native pip setting',
+                )
+            )
+        else:
+            checks.append(_evaluate_uv_setting(name, value, env))
+
+    return InstallerPrecheckReport(
+        installer=installer,
+        checks=tuple(checks),
+        constraints_txt_path=os.fspath(constraints_txt_path) if constraints_txt_path is not None else None,
+    )
 
 
 class IsolatedEnv(typing.Protocol):
@@ -142,6 +369,10 @@ class DefaultIsolatedEnv(IsolatedEnv):
 
             # uv is opt-in only.
             if self.installer == 'uv':
+                # Fail before creating anything when the migration cannot honour active pip-era settings.
+                report = installer_precheck('uv')
+                _ctx.log(report.format(), kind=('subprocess', 'cmd'))
+                report.raise_if_unsupported()
                 self._env_backend = _UvBackend()
             else:
                 self._env_backend = _PipBackend()
@@ -261,6 +492,58 @@ def _pip_env() -> dict[str, str] | None:
     if 'PIP_KEYRING_PROVIDER' not in os.environ and _has_keyring_cli():
         return {**os.environ, 'PIP_KEYRING_PROVIDER': 'subprocess'}
     return None
+
+
+def _pip_install_command(
+    python_executable: str,
+    constraints_txt_path: _types.StrPath | None,
+    requirement_file: _types.StrPath,
+    *,
+    use_outer_pip: bool,
+    fresh: bool,
+    verbosity: int,
+) -> list[str]:
+    """Build the exact ``pip install`` command line the pip backend runs."""
+    cmd = (
+        [sys.executable, '-m', 'pip', '--python', python_executable]
+        if use_outer_pip
+        else [python_executable, '-Im', 'pip']
+    )
+
+    if verbosity > 1:
+        cmd += [f'-{"v" * (verbosity - 1)}']
+
+    cmd += ['install']
+    if fresh:
+        cmd += ['--ignore-installed']
+    cmd += ['--use-pep517', '--no-warn-script-location', '--no-compile', '--no-input', '-r', os.fspath(requirement_file)]
+
+    if constraints_txt_path:
+        cmd += ['-c', str(constraints_txt_path)]
+
+    return cmd
+
+
+def _uv_install_command(
+    uv_bin: str,
+    python_executable: str,
+    requirements: Collection[str],
+    constraints_txt_path: _types.StrPath | None,
+    *,
+    verbosity: int,
+) -> list[str]:
+    """Build the exact ``uv pip install`` command line the uv backend runs."""
+    cmd = [uv_bin, 'pip']
+
+    if verbosity > 1:
+        cmd += [f'-{"v" * min(2, verbosity - 1)}']
+
+    cmd += ['install', *requirements, '--python', python_executable]
+
+    if constraints_txt_path:
+        cmd += ['-c', str(constraints_txt_path)]
+
+    return cmd
 
 
 class _PipBackend(_EnvBackend):
@@ -391,19 +674,6 @@ class _PipBackend(_EnvBackend):
         _fresh: bool = False,
     ) -> None:
         with contextlib.ExitStack() as exit_stack:
-            if self._has_valid_outer_pip:
-                cmd = [sys.executable, '-m', 'pip', '--python', self.python_executable]
-            else:
-                cmd = [self.python_executable, '-Im', 'pip']
-
-            if (verbosity := _ctx.verbosity) > 1:
-                cmd += [f'-{"v" * (verbosity - 1)}']
-
-            cmd += ['install']
-            if _fresh:
-                cmd += ['--ignore-installed']
-            cmd += ['--use-pep517', '--no-warn-script-location', '--no-compile', '--no-input']
-
             # pip does not honour environment markers in command line arguments
             # but it does from requirement files.
             with tempfile.NamedTemporaryFile(
@@ -412,10 +682,14 @@ class _PipBackend(_EnvBackend):
                 requirement_file.write('\n'.join(requirements))
             exit_stack.callback(functools.partial(os.unlink, requirement_file.name))
 
-            cmd += ['-r', os.path.abspath(requirement_file.name)]
-
-            if constraints_txt_path:
-                cmd += ['-c', str(constraints_txt_path)]
+            cmd = _pip_install_command(
+                self.python_executable,
+                constraints_txt_path,
+                os.path.abspath(requirement_file.name),
+                use_outer_pip=bool(self._has_valid_outer_pip),
+                fresh=_fresh,
+                verbosity=_ctx.verbosity,
+            )
 
             run_subprocess(cmd, env=_pip_env())
 
@@ -456,15 +730,13 @@ class _UvBackend(_EnvBackend):
         *,
         _fresh: bool = False,
     ) -> None:
-        cmd = [self._uv_bin, 'pip']
-
-        if (verbosity := _ctx.verbosity) > 1:
-            cmd += [f'-{"v" * min(2, verbosity - 1)}']
-
-        cmd += ['install', *requirements, '--python', self.python_executable]
-
-        if constraints_txt_path:
-            cmd += ['-c', str(constraints_txt_path)]
+        cmd = _uv_install_command(
+            self._uv_bin,
+            self.python_executable,
+            requirements,
+            constraints_txt_path,
+            verbosity=_ctx.verbosity,
+        )
 
         env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
         env['VIRTUAL_ENV'] = self._env_path
@@ -522,5 +794,10 @@ def _find_executable_and_scripts(path: str) -> tuple[str, str, str]:
 
 __all__ = [
     'DefaultIsolatedEnv',
+    'InstallerPrecheckError',
+    'InstallerPrecheckReport',
     'IsolatedEnv',
+    'SettingCheck',
+    'SettingStatus',
+    'installer_precheck',
 ]

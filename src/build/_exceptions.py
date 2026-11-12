@@ -60,3 +60,17 @@ class TypoWarning(Warning):
     """
     Warning raised when a possible typo is found.
     """
+
+
+class InstallerPrecheckError(BuildException):
+    """
+    Exception raised when the selected installer cannot honour an active build configuration.
+    """
+
+    def __init__(self, installer: str, message: str) -> None:
+        super().__init__(message)
+        self.installer = installer
+        self.message = message
+
+    def __str__(self) -> str:
+        return f'{self.installer} installer precheck failed: {self.message}'

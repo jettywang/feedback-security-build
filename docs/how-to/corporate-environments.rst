@@ -8,6 +8,11 @@ package repositories), or in restricted network environments.
 The pip settings below apply to the default installer. With ``--installer=uv``, use uv's `environment variables
 <https://docs.astral.sh/uv/configuration/environment/>`_.
 
+.. note::
+
+    When ``--installer=uv`` is selected, build runs a migration precheck that fails early if an active pip-era index,
+    TLS or constraint variable would be ignored. See :ref:`installer-migration-precheck` for the full mapping.
+
 *************************
  Private package indexes
 *************************

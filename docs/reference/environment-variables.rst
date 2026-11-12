@@ -36,6 +36,27 @@ pip using these environment variables to work with private package indexes or mi
     uv through its own `environment variables <https://docs.astral.sh/uv/configuration/environment/>`_ instead (e.g.,
     ``UV_INDEX_URL``, ``UV_EXTRA_INDEX_URL``).
 
+.. _installer-migration-precheck:
+
+Installer migration precheck
+============================
+
+Switching installers with ``--installer=uv`` while pip-era variables are still exported can silently drop index access
+restrictions or build dependency constraints. Before creating the build environment, build runs a precheck that
+evaluates every active installer-relevant variable against the selected installer:
+
+- generic network and TLS variables such as ``HTTPS_PROXY``, ``NO_PROXY`` and ``SSL_CERT_FILE`` are read natively by
+  both installers and always pass;
+- pip-specific variables with a uv equivalent (for example ``PIP_INDEX_URL`` -> ``UV_INDEX_URL`` and
+  ``PIP_CONSTRAINT`` -> ``UV_CONSTRAINT``) pass once the equivalent ``UV_*`` variable is set;
+- settings without a uv equivalent (for example ``PIP_TRUSTED_HOST`` and ``PIP_CONFIG_FILE``) are always reported as
+  unsupported.
+
+When one or more active settings cannot be honoured, build raises an :class:`build.env.InstallerPrecheckError`
+*before* creating the virtual environment, listing each blocking variable and the required remediation. Credentials
+embedded in index URLs are redacted from the report. The same check is available programmatically through
+:func:`build.env.installer_precheck`, which returns an :class:`build.env.InstallerPrecheckReport` without raising.
+
 ``PIP_INDEX_URL``
 =================
 

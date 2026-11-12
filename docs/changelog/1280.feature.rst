@@ -1,0 +1,3 @@
+Add an installer migration precheck: when ``--installer=uv`` is selected, build inspects active pip-era index, TLS and
+constraint environment variables, reports which ones uv honours, and fails before creating the build environment when a
+setting cannot be carried over.
