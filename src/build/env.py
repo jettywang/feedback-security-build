@@ -59,6 +59,25 @@ INSTALLERS: tuple[Installer, ...] = typing.get_args(Installer)
 # Match the ``venv`` CLI default. Symlinked interpreters on Windows can fail, see #1175.
 _USE_SYMLINKS = os.name != 'nt'
 
+# Variables required to launch the interpreter and operate the isolated
+# environment when the caller's environment is not inherited. ``PATH`` and
+# ``PYTHONPATH`` are always set by ``DefaultIsolatedEnv.make_extra_environ``.
+if os.name == 'nt':
+    _BASE_ENV_VARS = (
+        'APPDATA',
+        'COMSPEC',
+        'HOMEDRIVE',
+        'HOMEPATH',
+        'LOCALAPPDATA',
+        'PATHEXT',
+        'SYSTEMROOT',
+        'TEMP',
+        'TMP',
+        'USERPROFILE',
+    )
+else:
+    _BASE_ENV_VARS = ('HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'USER')
+
 
 class IsolatedEnv(typing.Protocol):
     """Isolated build environment ABC."""
@@ -71,6 +90,16 @@ class IsolatedEnv(typing.Protocol):
     @abc.abstractmethod
     def make_extra_environ(self) -> Mapping[str, str] | None:
         """Generate additional env vars specific to the isolated environment."""
+
+    def make_environ(self) -> Mapping[str, str] | None:
+        """
+        Generate the full environment for build hook subprocesses.
+
+        Returns None to let hooks inherit the caller's environment, overlaid with
+        :meth:`make_extra_environ`. Implementations may return a complete
+        environment instead to control exactly which variables hooks receive.
+        """
+        return None
 
 
 def _has_dependency(
@@ -110,9 +139,22 @@ class DefaultIsolatedEnv(IsolatedEnv):
         *,
         installer: Installer = 'pip',
         path: str | None = None,
+        inherit_env: Collection[str] | None = None,
+        extra_environ: Mapping[str, str] | None = None,
     ) -> None:
+        """
+        :param installer: The installer to use for the isolated environment
+        :param path: The location of the isolated environment, or None to use a temporary one
+        :param inherit_env: Names of environment variables to pass from the caller's environment to build hooks,
+            or None to let hooks inherit the full caller environment. When a collection is given (even an empty
+            one), hooks receive a minimal environment instead: the variables required to launch the interpreter
+            and operate the isolated environment, plus the named variables that are set in the caller
+        :param extra_environ: Additional environment variables to set for build hooks
+        """
         self.installer: Installer = installer
         self._requested_path = path
+        self._inherit_env = frozenset(inherit_env) if inherit_env is not None else None
+        self._extra_environ = dict(extra_environ) if extra_environ is not None else {}
 
     def __enter__(self) -> Self:
         if self._requested_path is None:
@@ -173,7 +215,7 @@ class DefaultIsolatedEnv(IsolatedEnv):
 
     def make_extra_environ(self) -> dict[str, str]:
         path = os.environ.get('PATH')
-        return {
+        extra = {
             'PATH': os.pathsep.join([self._env_backend.scripts_dir, path])
             if path is not None
             else self._env_backend.scripts_dir,
@@ -182,6 +224,23 @@ class DefaultIsolatedEnv(IsolatedEnv):
             # (the ``if pythonpath_env:`` check makes it a no-op).
             'PYTHONPATH': '',
         }
+        extra.update(self._extra_environ)
+        return extra
+
+    def make_environ(self) -> dict[str, str] | None:
+        """
+        Generate the full environment for build hook subprocesses.
+
+        Returns None when no variable passing policy is configured (``inherit_env`` was not given), signalling
+        that hooks should inherit the caller's environment. Otherwise returns a minimal environment containing
+        the variables required to launch the interpreter and operate the isolated environment, the variables
+        named by ``inherit_env`` that are set in the caller, and the variables given by ``extra_environ``.
+        """
+        if self._inherit_env is None:
+            return None
+        environ = {name: os.environ[name] for name in _BASE_ENV_VARS + tuple(self._inherit_env) if name in os.environ}
+        environ.update(self.make_extra_environ())
+        return environ
 
     def installed_versions(self, requirements: Collection[str]) -> dict[str, str]:
         """

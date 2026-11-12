@@ -41,6 +41,46 @@ def test_make_extra_environ_overrides_pythonpath() -> None:
         assert env._env_backend.scripts_dir in extra['PATH']
 
 
+def test_make_extra_environ_includes_extra_environ() -> None:
+    with build.env.DefaultIsolatedEnv(extra_environ={'APP_SETTING': 'value'}) as env:
+        assert env.make_extra_environ()['APP_SETTING'] == 'value'
+
+
+def test_make_environ_defaults_to_inheriting() -> None:
+    with build.env.DefaultIsolatedEnv() as env:
+        assert env.make_environ() is None
+
+
+def test_make_environ_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('SCHEDULER_ONLY_TOKEN', 'secret')
+    monkeypatch.setenv('APP_CHANNEL', 'stable')
+    with build.env.DefaultIsolatedEnv(
+        inherit_env=['APP_CHANNEL', 'UNSET_VARIABLE'],
+        extra_environ={'APP_EXPLICIT': 'explicit'},
+    ) as env:
+        environ = env.make_environ()
+
+    assert environ is not None
+    assert 'SCHEDULER_ONLY_TOKEN' not in environ
+    assert 'UNSET_VARIABLE' not in environ
+    assert environ['APP_CHANNEL'] == 'stable'
+    assert environ['APP_EXPLICIT'] == 'explicit'
+    assert environ['PYTHONPATH'] == ''
+    assert environ['PATH'].split(os.pathsep)[0] == env._env_backend.scripts_dir
+    for name in build.env._BASE_ENV_VARS:
+        if name in os.environ:
+            assert environ[name] == os.environ[name]
+
+
+def test_make_environ_policy_empty_inherit_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('SCHEDULER_ONLY_TOKEN', 'secret')
+    with build.env.DefaultIsolatedEnv(inherit_env=[]) as env:
+        environ = env.make_environ()
+
+    assert environ is not None
+    assert 'SCHEDULER_ONLY_TOKEN' not in environ
+
+
 def test_installed_versions(mocker: pytest_mock.MockerFixture) -> None:
     env = build.env.DefaultIsolatedEnv()
     mocker.patch.object(env, '_env_backend', SimpleNamespace(purelib='/purelib'), create=True)

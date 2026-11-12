@@ -55,6 +55,20 @@ build dependencies before invoking the backend:
 Pass ``path`` to ``DefaultIsolatedEnv`` to use a fixed location. The directory must be empty; it is removed when the
 ``with`` block exits cleanly and kept when the ``with`` block raises.
 
+Controlling the hook environment:
+
+By default, build hooks inherit the full environment of the calling process. Callers that hold variables the backend
+must not see (for example, scheduler credentials in a build worker) can pass ``inherit_env`` to opt into a minimal
+environment instead. Hooks then receive only the variables required to launch the interpreter and operate the
+isolated environment, the caller's variables named in ``inherit_env``, and any explicit values given via
+``extra_environ``:
+
+.. code-block:: python
+
+    with DefaultIsolatedEnv(inherit_env=["APP_CHANNEL"], extra_environ={"APP_MODE": "release"}) as env:
+        builder = ProjectBuilder.from_isolated_env(env, ".")
+        ...
+
 ``ProjectBuilder`` on its own uses the current environment. The ``runner`` argument customizes subprocess execution.
 
 Getting package metadata:

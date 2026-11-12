@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import importlib.metadata
+import json
 import logging
 import os
 import pathlib
@@ -525,6 +526,92 @@ def test_build_with_dep_on_console_script(
     path_vars = lines[0].split(os.pathsep)
     which_detected = lines[1]
     assert which_detected.startswith(path_vars[0]), out
+
+
+def test_from_isolated_env_env_policy(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scheduler-only variables must not reach build hooks when a variable passing policy is configured."""
+    monkeypatch.setenv('SCHEDULER_API_TOKEN', 'secret-token')
+    monkeypatch.setenv('SCHEDULER_JOB_ID', 'job-123')
+    monkeypatch.setenv('APP_CHANNEL', 'stable')
+    monkeypatch.delenv('PYTHONPATH', raising=False)
+
+    log_path = tmp_path / 'hook-env.jsonl'
+    source_dir = tmp_path / 'pkg'
+    source_dir.mkdir()
+    (source_dir / 'pyproject.toml').write_text(
+        textwrap.dedent(
+            '''
+            [build-system]
+            requires = []
+            build-backend = "recorder_backend"
+            backend-path = ["."]
+            '''
+        ),
+        encoding='utf-8',
+    )
+    (source_dir / 'recorder_backend.py').write_text(
+        textwrap.dedent(
+            '''
+            import json
+            import os
+
+            def _record(hook):
+                with open(os.environ['RECORDER_LOG'], 'a', encoding='utf-8') as f:
+                    json.dump({'hook': hook, 'env': dict(os.environ)}, f, sort_keys=True)
+                    f.write('\\n')
+
+            def get_requires_for_build_wheel(config_settings=None):
+                _record('get_requires_for_build_wheel')
+                return []
+
+            def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+                _record('prepare_metadata_for_build_wheel')
+                dist_info = 'recorder-0.1.dist-info'
+                os.makedirs(os.path.join(metadata_directory, dist_info), exist_ok=True)
+                with open(os.path.join(metadata_directory, dist_info, 'METADATA'), 'w') as f:
+                    f.write('Metadata-Version: 2.1\\nName: recorder\\nVersion: 0.1\\n')
+                return dist_info
+            '''
+        ),
+        encoding='utf-8',
+    )
+
+    def run_build(metadata_dir: pathlib.Path) -> None:
+        with build.env.DefaultIsolatedEnv(
+            inherit_env=['APP_CHANNEL'],
+            extra_environ={'RECORDER_LOG': str(log_path)},
+        ) as env:
+            builder = build.ProjectBuilder.from_isolated_env(env, source_dir)
+            assert builder.get_requires_for_build('wheel') == set()
+            builder.prepare('wheel', metadata_dir)
+
+    run_build(tmp_path / 'metadata-1')
+    run_build(tmp_path / 'metadata-2')
+
+    records = [json.loads(line) for line in log_path.read_text(encoding='utf-8').splitlines()]
+    assert [record['hook'] for record in records] == [
+        'get_requires_for_build_wheel',
+        'prepare_metadata_for_build_wheel',
+    ] * 2
+
+    for record in records:
+        hook_env = record['env']
+        assert 'SCHEDULER_API_TOKEN' not in hook_env
+        assert 'SCHEDULER_JOB_ID' not in hook_env
+        assert hook_env['APP_CHANNEL'] == 'stable'
+        assert hook_env['RECORDER_LOG'] == str(log_path)
+        assert hook_env['PYTHONPATH'] == ''
+
+    # the two consecutive builds observed identical environments (PATH excluded:
+    # each run uses a fresh isolated environment location)
+    for first, second in zip(records[:2], records[2:]):
+        first['env'].pop('PATH')
+        second['env'].pop('PATH')
+        assert first == second
+
+    # the caller's process environment was not mutated
+    assert 'RECORDER_LOG' not in os.environ
+    assert 'PYTHONPATH' not in os.environ
 
 
 def test_prepare(mocker: pytest_mock.MockerFixture, tmp_dir: str, package_test_flit: str) -> None:

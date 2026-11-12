@@ -167,7 +167,14 @@ def _wrap_subprocess_runner(runner: SubprocessRunner, env: env.IsolatedEnv) -> S
     def _invoke_wrapped_runner(
         cmd: Sequence[str], cwd: str | None = None, extra_environ: Mapping[str, str] | None = None
     ) -> None:
-        runner(cmd, cwd, {**(env.make_extra_environ() or {}), **(extra_environ or {})})
+        make_environ = getattr(env, 'make_environ', None)
+        environ = make_environ() if make_environ is not None else None
+        if environ is None:
+            runner(cmd, cwd, {**(env.make_extra_environ() or {}), **(extra_environ or {})})
+        else:
+            # A variable passing policy is in effect: spawn the hook directly with the
+            # provided environment instead of letting the runner merge the caller's.
+            subprocess.run(cmd, cwd=cwd, env={**environ, **(extra_environ or {})}, check=True)  # noqa: S603
 
     return _invoke_wrapped_runner
 
