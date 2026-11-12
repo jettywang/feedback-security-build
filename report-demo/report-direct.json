@@ -1,0 +1,20 @@
+{
+  "version": "1.1",
+  "complete": true,
+  "artifacts": [
+    {
+      "name": "report_demo-1.0.0-py3-none-any.whl",
+      "path": "/Users/apple/Documents/\u7528\u6237\u53cd\u9988\u9879\u76ee/run-control/first-five/jobs/FB-20261112-SEC7-067/workspace-002/report-demo/dist-direct/report_demo-1.0.0-py3-none-any.whl",
+      "kind": "wheel",
+      "stage": "wheel",
+      "built_from": {
+        "type": "source-tree",
+        "ref": "report-demo/goodpkg"
+      },
+      "size": 22,
+      "hashes": {
+        "sha256": "8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85"
+      }
+    }
+  ]
+}

@@ -28,6 +28,7 @@ sdist_files = {
     'src/build/py.typed',
     'tests/constraints.txt',
     'tests/packages/test-cant-build-via-sdist/some-file-that-is-needed-for-build.txt',
+    'tests/packages/test-sdist-missing-file/needed-for-wheel.txt',
     'tests/packages/test-no-project/empty.txt',
     'tests/packages/test-setuptools/MANIFEST.in',
     'tox.toml',

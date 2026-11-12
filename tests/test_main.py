@@ -60,16 +60,24 @@ class BuildKwargs(TypedDict):
     env_dir: str | None
 
 
+class BuiltFrom(TypedDict):
+    type: str
+    ref: str
+
+
 class ArtifactReport(TypedDict):
     name: str
     path: str
     kind: str
+    stage: str
+    built_from: BuiltFrom
     size: int
     hashes: dict[str, str]
 
 
 class BuildReport(TypedDict):
     version: str
+    complete: bool
     artifacts: list[ArtifactReport]
 
 
@@ -1395,24 +1403,52 @@ def built_dist(tmp_path: pathlib.Path) -> tuple[pathlib.Path, list[str]]:
     return outdir, names
 
 
+def make_records(names: list[str]) -> list[build.__main__._ArtifactRecord]:
+    return [
+        {
+            'name': name,
+            'stage': 'sdist' if name.endswith('.tar.gz') else 'wheel',
+            'built_from': {'type': 'source-tree', 'ref': '.'},
+        }
+        for name in names
+    ]
+
+
+def fake_via_sdist_build(names: list[str], records: list[build.__main__._ArtifactRecord]) -> Callable[..., list[str]]:
+    def build(srcdir: str, outdir: str, *args: object, journal: build.__main__._BuildJournal, **kwargs: object) -> list[str]:
+        for record in records:
+            journal.add(record['name'], stage=record['stage'], built_from=record['built_from'])
+        return names
+
+    return build
+
+
 def test_report_written(
     mocker: pytest_mock.MockerFixture,
     tmp_path: pathlib.Path,
     built_dist: tuple[pathlib.Path, list[str]],
 ) -> None:
     outdir, names = built_dist
-    mocker.patch('build.__main__.build_package_via_sdist', autospec=True, return_value=names)
+    records = make_records(names)
+    records[1]['built_from'] = {'type': 'sdist', 'ref': names[0]}
+    mocker.patch(
+        'build.__main__.build_package_via_sdist', autospec=True, side_effect=fake_via_sdist_build(names, records)
+    )
     report = tmp_path / 'report.json'
 
     build.__main__.main([str(tmp_path), '-o', str(outdir), '--report', str(report)])
 
     payload = cast(BuildReport, json.loads(report.read_text(encoding='utf-8')))
-    assert payload['version'] == '1.0'
+    assert payload['version'] == '1.1'
+    assert payload['complete'] is True
     assert [artifact['name'] for artifact in payload['artifacts']] == names
-    for artifact, name in zip(payload['artifacts'], names, strict=True):
+    for artifact, record in zip(payload['artifacts'], records, strict=True):
+        name = record['name']
         path = outdir / name
         assert artifact['path'] == os.path.join(str(outdir), name)
         assert artifact['kind'] == ('sdist' if name.endswith('.tar.gz') else 'wheel')
+        assert artifact['stage'] == record['stage']
+        assert artifact['built_from'] == record['built_from']
         assert artifact['size'] == path.stat().st_size
         assert artifact['hashes'] == {'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
 
@@ -1425,7 +1461,11 @@ def test_report_path_is_absolute_with_relative_outdir(
 ) -> None:
     """A relative --outdir used to echo a relative path into the report; the schema promises an absolute one."""
     outdir, names = built_dist
-    mocker.patch('build.__main__.build_package_via_sdist', autospec=True, return_value=names)
+    mocker.patch(
+        'build.__main__.build_package_via_sdist',
+        autospec=True,
+        side_effect=fake_via_sdist_build(names, make_records(names)),
+    )
     monkeypatch.chdir(tmp_path)
     report = tmp_path / 'report.json'
 
@@ -1448,7 +1488,7 @@ def test_write_report_is_atomic(tmp_path: pathlib.Path, built_dist: tuple[pathli
     outdir, names = built_dist
     report = tmp_path / 'report.json'
 
-    build.__main__._write_report(report, str(outdir), names)
+    build.__main__._write_report(report, str(outdir), make_records(names))
 
     assert not list(tmp_path.glob('*.tmp'))
     assert not list(outdir.glob('*.tmp'))
@@ -1461,7 +1501,7 @@ def test_write_report_cleans_tmp_on_failure(
     mocker.patch('build.__main__.os.replace', side_effect=OSError('boom'))
 
     with pytest.raises(OSError, match='boom'):
-        build.__main__._write_report(tmp_path / 'report.json', str(outdir), names)
+        build.__main__._write_report(tmp_path / 'report.json', str(outdir), make_records(names))
 
     assert not list(tmp_path.glob('*.tmp'))
 
@@ -1470,9 +1510,134 @@ def test_write_report_creates_parent_directory(tmp_path: pathlib.Path, built_dis
     outdir, names = built_dist
     report = tmp_path / 'nested' / 'dir' / 'report.json'
 
-    build.__main__._write_report(report, str(outdir), names)
+    build.__main__._write_report(report, str(outdir), make_records(names))
 
     assert report.is_file()
+
+
+def test_try_write_report_warns_instead_of_raising(
+    mocker: pytest_mock.MockerFixture, tmp_path: pathlib.Path
+) -> None:
+    mocker.patch('build.__main__._write_report', side_effect=OSError('boom'))
+
+    with pytest.warns(UserWarning, match='Failed to write build report'):
+        build.__main__._try_write_report(tmp_path / 'report.json', str(tmp_path), [], complete=False)
+
+
+def test_build_package_records_journal(mocker: pytest_mock.MockerFixture) -> None:
+    mocker.patch(
+        'build.__main__._build',
+        autospec=True,
+        side_effect=[
+            os.path.join('dist', 'test_pkg-1.0.0.tar.gz'),
+            os.path.join('dist', 'test_pkg-1.0.0-py3-none-any.whl'),
+        ],
+    )
+    journal = build.__main__._BuildJournal({'type': 'source-tree', 'ref': '.'})
+
+    built = build.__main__.build_package('source', 'dist', ['sdist', 'wheel'], journal=journal)
+
+    assert built == ['test_pkg-1.0.0.tar.gz', 'test_pkg-1.0.0-py3-none-any.whl']
+    assert journal.records == [
+        {'name': 'test_pkg-1.0.0.tar.gz', 'stage': 'sdist', 'built_from': {'type': 'source-tree', 'ref': '.'}},
+        {'name': 'test_pkg-1.0.0-py3-none-any.whl', 'stage': 'wheel', 'built_from': {'type': 'source-tree', 'ref': '.'}},
+    ]
+
+
+def test_build_package_via_sdist_records_journal(mocker: pytest_mock.MockerFixture) -> None:
+    mocker.patch(
+        'build.__main__._build',
+        autospec=True,
+        side_effect=[
+            os.path.join('dist', 'test_pkg-1.0.0.tar.gz'),
+            os.path.join('dist', 'test_pkg-1.0.0-py3-none-any.whl'),
+        ],
+    )
+    extract = mocker.patch('build.__main__._extract_sdist')
+    extract.return_value.__enter__.return_value = 'extracted'
+    journal = build.__main__._BuildJournal({'type': 'source-tree', 'ref': '.'})
+
+    built = build.__main__.build_package_via_sdist('source', 'dist', ['wheel'], journal=journal)
+
+    assert built == ['test_pkg-1.0.0.tar.gz', 'test_pkg-1.0.0-py3-none-any.whl']
+    assert journal.records == [
+        {'name': 'test_pkg-1.0.0.tar.gz', 'stage': 'sdist', 'built_from': {'type': 'source-tree', 'ref': '.'}},
+        {
+            'name': 'test_pkg-1.0.0-py3-none-any.whl',
+            'stage': 'wheel',
+            'built_from': {'type': 'sdist', 'ref': 'test_pkg-1.0.0.tar.gz'},
+        },
+    ]
+
+
+def test_source_tree_ref_is_relative(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert build.__main__._source_tree_ref(tmp_path) == '.'
+    assert build.__main__._source_tree_ref(tmp_path / 'sub' / 'dir') == os.path.join('sub', 'dir')
+
+
+def test_source_tree_ref_falls_back_to_basename_on_value_error(mocker: pytest_mock.MockerFixture) -> None:
+    # Windows raises ValueError when the source tree is on a different drive than the working directory
+    mocker.patch('build.__main__.os.path.relpath', side_effect=ValueError)
+
+    assert build.__main__._source_tree_ref(os.path.join(os.sep, 'some', 'path')) == 'path'
+
+
+def test_report_sdist_input_records_sdist_source(
+    mocker: pytest_mock.MockerFixture,
+    tmp_path: pathlib.Path,
+    sdist: pathlib.Path,
+) -> None:
+    wheel_name = 'demo-1.0.0-py3-none-any.whl'
+
+    def fake_build(
+        srcdir: str, outdir: str, *args: object, journal: build.__main__._BuildJournal, **kwargs: object
+    ) -> list[str]:
+        journal.add(wheel_name, stage='wheel')
+        pathlib.Path(outdir, wheel_name).write_bytes(b'wheel contents')
+        return [wheel_name]
+
+    mocker.patch('build.__main__.build_package', autospec=True, side_effect=fake_build)
+    report = tmp_path / 'report.json'
+
+    build.__main__.main([str(sdist), '--report', str(report)])
+
+    payload = cast(BuildReport, json.loads(report.read_text(encoding='utf-8')))
+    assert payload['complete'] is True
+    assert len(payload['artifacts']) == 1
+    wheel = payload['artifacts'][0]
+    assert wheel['name'] == wheel_name
+    assert wheel['stage'] == 'wheel'
+    assert wheel['built_from'] == {'type': 'sdist', 'ref': 'demo-1.0.0.tar.gz'}
+
+
+def test_report_written_on_via_sdist_failure(tmp_path: pathlib.Path, package_test_sdist_missing_file: str) -> None:
+    """When the wheel stage of a via-sdist build fails, the report still lists the sdist built in the first stage."""
+    outdir = tmp_path / 'dist'
+    report = tmp_path / 'report.json'
+
+    with pytest.raises(SystemExit):
+        build.__main__.main(
+            [package_test_sdist_missing_file, '-n', '-x', '-o', str(outdir), '--report', str(report)]
+        )
+
+    payload = cast(BuildReport, json.loads(report.read_text(encoding='utf-8')))
+    assert payload['version'] == '1.1'
+    assert payload['complete'] is False
+    assert len(payload['artifacts']) == 1
+    sdist = payload['artifacts'][0]
+    assert sdist['name'] == 'test_sdist_missing_file-1.0.0.tar.gz'
+    assert sdist['kind'] == 'sdist'
+    assert sdist['stage'] == 'sdist'
+    assert sdist['built_from'] == {
+        'type': 'source-tree',
+        'ref': os.path.relpath(package_test_sdist_missing_file),
+    }
+    assert sdist['path'] == os.path.join(str(outdir), sdist['name'])
+    assert sdist['hashes'] == {'sha256': hashlib.sha256((outdir / sdist['name']).read_bytes()).hexdigest()}
+    # the temporary sdist extraction directory must not leak into the report
+    assert 'build-via-sdist-' not in report.read_text(encoding='utf-8')
 
 
 def test_report_not_allowed_with_metadata(capsys: pytest.CaptureFixture[str]) -> None:

@@ -1,0 +1,20 @@
+{
+  "version": "1.1",
+  "complete": false,
+  "artifacts": [
+    {
+      "name": "test_sdist_missing_file-1.0.0.tar.gz",
+      "path": "/Users/apple/Documents/\u7528\u6237\u53cd\u9988\u9879\u76ee/run-control/first-five/jobs/FB-20261112-SEC7-067/workspace-002/report-demo/dist-fail/test_sdist_missing_file-1.0.0.tar.gz",
+      "kind": "sdist",
+      "stage": "sdist",
+      "built_from": {
+        "type": "source-tree",
+        "ref": "tests/packages/test-sdist-missing-file"
+      },
+      "size": 10240,
+      "hashes": {
+        "sha256": "93a9b8f9cb6391587bac9dde6a1961d92d879dbd63d4a6cba9bc5b49ee76ee14"
+      }
+    }
+  ]
+}

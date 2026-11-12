@@ -1,0 +1,1 @@
+This file is present in the source tree but intentionally left out of the sdist.

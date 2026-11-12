@@ -320,6 +320,48 @@ def _natural_language_list(elements: Sequence[str]) -> str:
     )
 
 
+class _BuiltFrom(TypedDict):
+    type: str  # 'source-tree' or 'sdist'
+    ref: str  # relative identifier: the source tree's path relative to the working directory, or the sdist's file name
+
+
+class _ArtifactRecord(TypedDict):
+    name: str
+    stage: str
+    built_from: _BuiltFrom
+
+
+class _BuildJournal:
+    """Collects a provenance record for each artifact as soon as it is built."""
+
+    def __init__(self, source: _BuiltFrom) -> None:
+        self.source = source
+        self.records: list[_ArtifactRecord] = []
+
+    def add(self, name: str, *, stage: str, built_from: _BuiltFrom | None = None) -> None:
+        self.records.append(
+            {
+                'name': name,
+                'stage': stage,
+                'built_from': built_from if built_from is not None else self.source,
+            }
+        )
+
+
+def _source_tree_ref(srcdir: StrPath) -> str:
+    """A relative identifier for a source tree, so reports stay comparable across machines and checkouts."""
+    try:
+        return os.path.relpath(os.path.abspath(srcdir))
+    except ValueError:  # Windows: srcdir is on a different drive than the working directory
+        return os.path.basename(os.path.abspath(srcdir))
+
+
+def _build_source(srcdir: StrPath, *, sdist_input: bool) -> _BuiltFrom:
+    if sdist_input:
+        return {'type': 'sdist', 'ref': os.path.basename(os.fspath(srcdir))}
+    return {'type': 'source-tree', 'ref': _source_tree_ref(srcdir)}
+
+
 def build_package(
     srcdir: StrPath,
     outdir: StrPath,
@@ -330,6 +372,7 @@ def build_package(
     dependency_constraints_txt: os.PathLike[str] | None = None,
     installer: _env.Installer = 'pip',
     env_dir: str | None = None,
+    journal: _BuildJournal | None = None,
 ) -> list[str]:
     """
     Run the build process.
@@ -341,6 +384,7 @@ def build_package(
     :param isolation: Isolate the build in a separate environment
     :param skip_dependency_check: Do not perform the dependency check
     :param env_dir: Location of the isolated build environment (a temporary directory is used when not set)
+    :param journal: If given, each built artifact is recorded with its stage and source as soon as it is built
     """
     built: list[str] = []
     for distribution in distributions:
@@ -355,7 +399,10 @@ def build_package(
             installer,
             env_dir,
         )
-        built.append(os.path.basename(out))
+        name = os.path.basename(out)
+        built.append(name)
+        if journal is not None:
+            journal.add(name, stage=distribution)
     return built
 
 
@@ -370,6 +417,7 @@ def build_package_via_sdist(
     installer: _env.Installer = 'pip',
     sdist_extract_dir: StrPath | None = None,
     env_dir: str | None = None,
+    journal: _BuildJournal | None = None,
 ) -> list[str]:
     """
     Build a sdist and then the specified distributions from it.
@@ -383,6 +431,7 @@ def build_package_via_sdist(
     :param sdist_extract_dir: Directory to extract the intermediate sdist into; a temporary directory is used and
         removed afterwards when ``None``
     :param env_dir: Location of the isolated build environment (a temporary directory is used when not set)
+    :param journal: If given, each built artifact is recorded with its stage and source as soon as it is built
     """
     if 'sdist' in distributions:
         msg = 'Only binary distributions are allowed but sdist was specified'
@@ -401,6 +450,8 @@ def build_package_via_sdist(
     )
 
     sdist_name = os.path.basename(sdist)
+    if journal is not None:
+        journal.add(sdist_name, stage='sdist')
     built: list[str] = []
     if distributions:
         with _extract_sdist(sdist, extract_dir=sdist_extract_dir) as extracted_srcdir:
@@ -417,7 +468,10 @@ def build_package_via_sdist(
                     installer,
                     env_dir,
                 )
-                built.append(os.path.basename(out))
+                name = os.path.basename(out)
+                built.append(name)
+                if journal is not None:
+                    journal.add(name, stage=distribution, built_from={'type': 'sdist', 'ref': sdist_name})
     return [sdist_name, *built]
 
 
@@ -611,8 +665,9 @@ def main_parser() -> argparse.ArgumentParser:
     )
     build_group.add_argument(
         '--report',
-        help='write a machine-readable JSON report of the built artifacts (name, path, kind, size and SHA-256 hash) '
-        'to this path. Cannot be used together with ``--metadata``',
+        help='write a machine-readable JSON report of the built artifacts (name, path, kind, build stage and source, '
+        'size and SHA-256 hash) to this path; if the build fails partway, the report is still written with the '
+        'artifacts completed so far. Cannot be used together with ``--metadata``',
         metavar='PATH',
     )
     config_exclusive_group = build_group.add_mutually_exclusive_group()
@@ -731,14 +786,26 @@ def main(cli_args: Sequence[str], prog: str | None = None) -> None:
     else:
         outdir = os.path.join(args.srcdir, 'dist')
 
+    report_path = args.report
+    journal: _BuildJournal | None = None
+    if report_path is not None:
+        journal = _BuildJournal(_build_source(args.srcdir, sdist_input=sdist_input))
+        run_build = partial(run_build, journal=journal)
+
     with _handle_build_error(env_dir=args.env_dir, sdist_extract_dir=args.sdist_extract_dir):
-        if sdist_input:
-            with _extract_sdist(args.srcdir, extract_dir=args.sdist_extract_dir) as extracted_srcdir:
-                built = run_build(extracted_srcdir, outdir)
-        else:
-            built = run_build(args.srcdir, outdir)
-        if args.report is not None:
-            _write_report(args.report, outdir, built)
+        try:
+            if sdist_input:
+                with _extract_sdist(args.srcdir, extract_dir=args.sdist_extract_dir) as extracted_srcdir:
+                    built = run_build(extracted_srcdir, outdir)
+            else:
+                built = run_build(args.srcdir, outdir)
+        except Exception:
+            # Reflect the artifacts completed before the failure (e.g. the sdist of a via-sdist build).
+            if journal is not None:
+                _try_write_report(report_path, outdir, journal.records, complete=False)
+            raise
+        if journal is not None:
+            _write_report(report_path, outdir, journal.records)
         if _ctx.verbosity >= -1 and built:
             artifact_list = _natural_language_list(
                 ['{underline}{}{reset}{bold}{green}'.format(artifact, **_styles.get()['stdout']) for artifact in built]
@@ -750,19 +817,25 @@ class _ArtifactReport(TypedDict):
     name: str
     path: str
     kind: str
+    stage: str
+    built_from: _BuiltFrom
     size: int
     hashes: dict[str, str]
 
 
 class _BuildReport(TypedDict):
     version: str
+    complete: bool
     artifacts: list[_ArtifactReport]
 
 
-def _write_report(path: StrPath, outdir: StrPath, artifacts: Sequence[str]) -> None:
+def _write_report(path: StrPath, outdir: StrPath, artifacts: Sequence[_ArtifactRecord], *, complete: bool = True) -> None:
     report: _BuildReport = {
-        'version': '1.0',
-        'artifacts': [_describe_artifact(os.path.abspath(os.path.join(outdir, name)), name) for name in artifacts],
+        'version': '1.1',
+        'complete': complete,
+        'artifacts': [
+            _describe_artifact(os.path.abspath(os.path.join(outdir, record['name'])), record) for record in artifacts
+        ],
     }
     data = json.dumps(report, indent=2) + '\n'
 
@@ -779,17 +852,28 @@ def _write_report(path: StrPath, outdir: StrPath, artifacts: Sequence[str]) -> N
         raise
 
 
-def _describe_artifact(path: str, name: str) -> _ArtifactReport:
+def _try_write_report(path: StrPath, outdir: StrPath, artifacts: Sequence[_ArtifactRecord], *, complete: bool) -> None:
+    """Best-effort report write that never masks the original build failure."""
+    try:
+        _write_report(path, outdir, artifacts, complete=complete)
+    except OSError as exc:
+        warnings.warn(f'Failed to write build report to {os.fspath(path)}: {exc}', stacklevel=2)
+
+
+def _describe_artifact(path: str, record: _ArtifactRecord) -> _ArtifactReport:
     digest = hashlib.sha256()
     size = 0
     with open(path, 'rb') as artifact:
         while chunk := artifact.read(65536):
             size += len(chunk)
             digest.update(chunk)
+    name = record['name']
     return {
         'name': name,
         'path': path,
         'kind': 'sdist' if name.endswith('.tar.gz') else 'wheel',
+        'stage': record['stage'],
+        'built_from': record['built_from'],
         'size': size,
         'hashes': {'sha256': digest.hexdigest()},
     }

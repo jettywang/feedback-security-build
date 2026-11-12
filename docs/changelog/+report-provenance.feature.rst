@@ -1,0 +1,1 @@
+Record each artifact's build stage and source in the ``--report`` file (schema 1.1), distinguishing wheels built directly from the source tree from wheels built via an sdist, and write the report on build failure with the artifacts completed so far

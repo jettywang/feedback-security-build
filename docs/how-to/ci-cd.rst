@@ -528,6 +528,11 @@ The report also includes each artifact's size and SHA-256 hash, useful for emitt
 
     $ jq -r '.artifacts[] | "\(.hashes.sha256)  \(.name)"' build-report.json
 
+Each artifact also records the build ``stage`` that produced it and what it was ``built_from``, so pipelines can tell
+a wheel built directly from the source tree apart from one built via an sdist. If the build fails partway, the report
+is still written with ``complete`` set to ``false`` and the artifacts finished before the failure; pipelines reading
+the report after a failed build should check ``complete`` before acting on it.
+
 See :ref:`build-report` for the full report schema.
 
 ******************

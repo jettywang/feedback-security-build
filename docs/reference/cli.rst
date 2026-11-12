@@ -73,7 +73,9 @@ At normal verbosity, isolated builds also print the installed versions of declar
  Build Report
 **************
 
-``--report PATH`` writes a JSON description of the built artifacts to ``PATH`` after a successful build.
+``--report PATH`` writes a JSON description of the built artifacts to ``PATH``. If the build fails partway, the
+report is still written, with ``complete`` set to ``false`` and only the artifacts finished before the failure — for
+example, when the wheel step of a default (via-sdist) build fails, the report lists the sdist that was already built.
 
 .. code-block:: console
 
@@ -95,12 +97,18 @@ The schema is:
 .. code-block:: json
 
     {
-      "version": "1.0",
+      "version": "1.1",
+      "complete": true,
       "artifacts": [
         {
           "name": "mypackage-1.0.0.tar.gz",
           "path": "/path/to/example/dist/mypackage-1.0.0.tar.gz",
           "kind": "sdist",
+          "stage": "sdist",
+          "built_from": {
+            "type": "source-tree",
+            "ref": "."
+          },
           "size": 852,
           "hashes": {
             "sha256": "dbd5486e6e893663263caf84a4b87d67cc28f6963b6650f69eaa54b78e42ece4"
@@ -110,6 +118,11 @@ The schema is:
           "name": "mypackage-1.0.0-py3-none-any.whl",
           "path": "/path/to/example/dist/mypackage-1.0.0-py3-none-any.whl",
           "kind": "wheel",
+          "stage": "wheel",
+          "built_from": {
+            "type": "sdist",
+            "ref": "mypackage-1.0.0.tar.gz"
+          },
           "size": 1121,
           "hashes": {
             "sha256": "ef460897fdce998634efc3385aa4261b4280a2fe2ab0e08ddcacc8496658465d"
@@ -118,8 +131,19 @@ The schema is:
       ]
     }
 
-``version`` is the schema version. Each artifact lists its ``name`` (basename), ``path`` (absolute, so the report reads
-the same wherever it is saved), ``kind`` (``sdist`` or ``wheel``), ``size`` in bytes, and ``hashes`` keyed by algorithm.
+``version`` is the schema version. ``complete`` is ``true`` when every requested distribution was built; a report
+written after a failed build sets it to ``false`` and lists only the artifacts finished before the failure. Each
+artifact lists its ``name`` (basename), ``path`` (absolute, so the report reads the same wherever it is saved),
+``kind`` (``sdist`` or ``wheel``), ``stage`` (the build stage that produced it), ``built_from`` (what the artifact
+was built from), ``size`` in bytes, and ``hashes`` keyed by algorithm.
+
+``built_from.type`` is ``source-tree`` when the artifact was built directly from the working directory, or ``sdist``
+when it was built from an extracted source distribution — this is what tells a directly built wheel apart from one
+built via an sdist. ``built_from.ref`` identifies that source with a relative, machine-comparable value: the source
+tree's path relative to the working directory (``.`` when building the current directory), or the file name of the
+sdist. Temporary extraction directories are never recorded, so reports from different runs and machines can be
+compared directly.
+
 ``--report`` cannot be combined with ``--metadata``.
 
 To inspect a wheel listed in the report, pass its path straight to ``--metadata``: when the source argument is a
