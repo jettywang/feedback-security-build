@@ -1,0 +1,3 @@
+Merge the ``--no-isolation`` "Unmet dependencies" report so a dependency referenced by several parents is listed once
+with every source chain that reaches it (``required via`` lines), and treat differently cased spellings of the same
+package as one requirement. Dependency-chain collection is now separate from the human-readable formatting.

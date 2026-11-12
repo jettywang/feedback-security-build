@@ -43,6 +43,22 @@ the active environment.
             wanted: >=1.0.1
             found: 1.0.0
 
+When the same dependency is pulled in by more than one parent it is reported once, with every source chain that
+reaches it listed under ``required via``:
+
+::
+
+    ERROR Unmet dependencies (checked against /usr/local/bin/python3.9):
+        shared-lib
+            required via: parent-a -> Shared_Lib
+            required via: parent-b -> shared-lib
+            wanted: any
+            found: not installed
+
+Package names are matched case-insensitively, so differently cased spellings of the same package are merged into a
+single entry; each ``required via`` line keeps the spelling used by that parent so the original declaration remains
+traceable.
+
 **Cause**: build checks the declared requirements against the interpreter named in the header (the one running build),
 not against a virtual environment or your system package manager. Read each entry as:
 

@@ -15,12 +15,14 @@ import zipfile
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NoReturn
 
+import packaging.utils
 import pyproject_hooks
 import pytest
 import pytest_mock
 
 import build
 import build._builder
+import build._util
 
 
 if TYPE_CHECKING:
@@ -250,6 +252,153 @@ def test_check_dependency_exhausted(
     assert list(build.check_dependency(requirement_string)) == expected
 
 
+def _registry_distribution(monkeypatch: pytest.MonkeyPatch, registry: dict[str, str]) -> None:
+    class RegistryDistribution(MockDistribution):
+        _metadata = ''
+
+        @classmethod
+        def from_name(cls, name: str) -> RegistryDistribution:
+            if name not in registry:
+                raise importlib.metadata.PackageNotFoundError(name)
+            dist = cls()
+            dist._metadata = registry[name]
+            return dist
+
+    monkeypatch.setattr(importlib.metadata, 'Distribution', RegistryDistribution)
+
+
+def test_collect_unmet_dependencies_merges_case_variants_and_parents() -> None:
+    # The same missing package, spelled differently, reached through three parents.
+    chains = [
+        ('parent_a', 'Shared_Lib'),
+        ('parent_b', 'shared-lib'),
+        ('parent_c', 'SHARED_LIB>=1'),
+    ]
+
+    records = build._util.collect_unmet_dependencies(chains)
+
+    assert records == (
+        build._util.UnmetDependency(
+            'shared-lib',
+            (
+                ('parent_a', 'Shared_Lib'),
+                ('parent_b', 'shared-lib'),
+            ),
+        ),
+        build._util.UnmetDependency('shared-lib>=1', (('parent_c', 'SHARED_LIB>=1'),)),
+    )
+
+
+def test_collect_unmet_dependencies_deduplicates_identical_paths() -> None:
+    # Repeated paths (e.g. the same requirement listed twice) collapse to one chain.
+    chains = [('parent', 'shared-lib'), ('parent', 'shared-lib'), ('shared-lib',)]
+
+    assert build._util.collect_unmet_dependencies(chains) == (
+        build._util.UnmetDependency('shared-lib', (('parent', 'shared-lib'), ('shared-lib',))),
+    )
+
+
+def test_check_dependency_case_insensitive_memoization(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A satisfied subtree spelled with different casing on each path is walked once,
+    # and an unsatisfied one is still reported through every parent.
+    registry = {
+        'root': 'Metadata-Version: 2.2\nName: root\nVersion: 1.0\n'
+        'Requires-Dist: parent_a\nRequires-Dist: parent_b\n',
+        'parent-a': 'Metadata-Version: 2.2\nName: parent_a\nVersion: 1.0\nRequires-Dist: Shared_Leaf\n',
+        'parent-b': 'Metadata-Version: 2.2\nName: parent_b\nVersion: 1.0\nRequires-Dist: shared_leaf\n',
+        'shared-leaf': 'Metadata-Version: 2.2\nName: shared_leaf\nVersion: 1.0\n',
+    }
+    lookups: dict[str, int] = {}
+
+    class CountingDistribution(MockDistribution):
+        _metadata = ''
+
+        @classmethod
+        def from_name(cls, name: str) -> CountingDistribution:
+            key = packaging.utils.canonicalize_name(name)
+            if key not in registry:
+                raise importlib.metadata.PackageNotFoundError(name)
+            lookups[key] = lookups.get(key, 0) + 1
+            dist = cls()
+            dist._metadata = registry[key]
+            return dist
+
+    monkeypatch.setattr(importlib.metadata, 'Distribution', CountingDistribution)
+
+    assert list(build.check_dependency('root')) == []
+    assert lookups == {'root': 1, 'parent-a': 1, 'parent-b': 1, 'shared-leaf': 1}
+
+
+def test_check_dependencies_merges_conditional_and_duplicate_chains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # parent_a: case-variant missing dep + a conditional dep whose marker is not met
+    # parent_b: the same missing dep spelled canonically, declared twice
+    registry = {
+        'parent_a': 'Metadata-Version: 2.2\nName: parent_a\nVersion: 1.0\n'
+        "Requires-Dist: Missing_Lib\nRequires-Dist: conditional_dep; sys_platform == 'neveros'\n",
+        'parent_b': 'Metadata-Version: 2.2\nName: parent_b\nVersion: 1.0\n'
+        'Requires-Dist: missing-lib\nRequires-Dist: missing-lib\n',
+    }
+    _registry_distribution(monkeypatch, registry)
+
+    records = build._util.collect_unmet_dependencies(
+        [*build.check_dependency('parent_a'), *build.check_dependency('parent_b')]
+    )
+
+    assert records == (
+        build._util.UnmetDependency(
+            'missing-lib',
+            (
+                ('parent_a', 'Missing_Lib'),
+                ('parent_b', 'missing-lib'),
+            ),
+        ),
+    )
+
+
+def test_format_unmet_dependencies_single_chain_stays_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _registry_distribution(
+        monkeypatch,
+        {'present': 'Metadata-Version: 2.2\nName: present\nVersion: 1.0.0\n'},
+    )
+
+    not_installed = build._util.collect_unmet_dependencies([('matplotlib>=2.2', 'kiwisolver')])
+    assert build._util.format_unmet_dependencies(not_installed) == (
+        f'Unmet dependencies (checked against {sys.executable}):'
+        '\n\tmatplotlib>=2.2 -> kiwisolver'
+        '\n\t\twanted: any'
+        '\n\t\tfound: not installed'
+    )
+
+    version_mismatch = build._util.collect_unmet_dependencies([('present>=2',)])
+    assert build._util.format_unmet_dependencies(version_mismatch) == (
+        f'Unmet dependencies (checked against {sys.executable}):'
+        '\n\tpresent>=2'
+        '\n\t\twanted: >=2'
+        '\n\t\tfound: 1.0.0'
+    )
+
+
+def test_format_unmet_dependencies_multiple_chains(monkeypatch: pytest.MonkeyPatch) -> None:
+    _registry_distribution(monkeypatch, {})
+
+    records = build._util.collect_unmet_dependencies(
+        [('parent_a', 'Shared_Lib'), ('parent_b', 'shared-lib')]
+    )
+
+    assert build._util.format_unmet_dependencies(records) == (
+        f'Unmet dependencies (checked against {sys.executable}):'
+        '\n\tshared-lib'
+        '\n\t\trequired via: parent_a -> Shared_Lib'
+        '\n\t\trequired via: parent_b -> shared-lib'
+        '\n\t\twanted: any'
+        '\n\t\tfound: not installed'
+    )
+
+
 def test_bad_project(package_test_no_project: str) -> None:
     # Passing a nonexistent project directory
     with pytest.raises(build.BuildException):
@@ -368,12 +517,18 @@ def test_check_dependencies(
     get_requires_wheel.side_effect = copy.copy(side_effects)
 
     # requires = []
-    assert builder.check_dependencies('sdist') == {('flit_core<4,>=2',)}
-    assert builder.check_dependencies('wheel') == {('flit_core<4,>=2',)}
+    assert builder.check_dependencies('sdist') == (build._util.UnmetDependency('flit-core<4,>=2', (('flit_core<4,>=2',),)),)
+    assert builder.check_dependencies('wheel') == (build._util.UnmetDependency('flit-core<4,>=2', (('flit_core<4,>=2',),)),)
 
     # requires = ['something']
-    assert builder.check_dependencies('sdist') == {('flit_core<4,>=2',), ('something',)}
-    assert builder.check_dependencies('wheel') == {('flit_core<4,>=2',), ('something',)}
+    assert builder.check_dependencies('sdist') == (
+        build._util.UnmetDependency('flit-core<4,>=2', (('flit_core<4,>=2',),)),
+        build._util.UnmetDependency('something', (('something',),)),
+    )
+    assert builder.check_dependencies('wheel') == (
+        build._util.UnmetDependency('flit-core<4,>=2', (('flit_core<4,>=2',),)),
+        build._util.UnmetDependency('something', (('something',),)),
+    )
 
     # BackendUnavailable
     with pytest.raises(build.BuildBackendException):

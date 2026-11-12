@@ -26,6 +26,7 @@ import pytest_mock
 import build
 import build.__main__
 import build._ctx
+import build._util
 import build.env
 
 from build._compat.tarfile import tarfile
@@ -334,7 +335,10 @@ def test_build_package_via_sdist_passes_config_settings_to_build(mocker: pytest_
 def test_build_no_isolation_check_deps_not_installed(mocker: pytest_mock.MockerFixture, package_test_flit: str) -> None:
     error = mocker.patch('build.__main__._error')
     build_cmd = mocker.patch('build.ProjectBuilder.build', return_value='something')
-    mocker.patch('build.ProjectBuilder.check_dependencies', return_value=[('foo>=1.0',)])
+    mocker.patch(
+        'build.ProjectBuilder.check_dependencies',
+        return_value=[build._util.UnmetDependency('foo>=1.0', (('foo>=1.0',),))],
+    )
     mocker.patch('importlib.metadata.distribution', side_effect=importlib.metadata.PackageNotFoundError)
 
     build.__main__.build_package(package_test_flit, '.', ['sdist'], isolation=False)
@@ -348,7 +352,10 @@ def test_build_no_isolation_check_deps_not_installed(mocker: pytest_mock.MockerF
 def test_build_no_isolation_check_deps_version_mismatch(mocker: pytest_mock.MockerFixture, package_test_flit: str) -> None:
     error = mocker.patch('build.__main__._error')
     mocker.patch('build.ProjectBuilder.build', return_value='something')
-    mocker.patch('build.ProjectBuilder.check_dependencies', return_value=[('bar>=2.0',)])
+    mocker.patch(
+        'build.ProjectBuilder.check_dependencies',
+        return_value=[build._util.UnmetDependency('bar>=2.0', (('bar>=2.0',),))],
+    )
     mocker.patch('importlib.metadata.distribution', return_value=mocker.MagicMock(version='1.0.0'))
 
     build.__main__.build_package(package_test_flit, '.', ['sdist'], isolation=False)
@@ -363,7 +370,10 @@ def test_build_no_isolation_check_deps_chain_without_specifier(
 ) -> None:
     error = mocker.patch('build.__main__._error')
     mocker.patch('build.ProjectBuilder.build', return_value='something')
-    mocker.patch('build.ProjectBuilder.check_dependencies', return_value=[('matplotlib>=2.2', 'kiwisolver')])
+    mocker.patch(
+        'build.ProjectBuilder.check_dependencies',
+        return_value=[build._util.UnmetDependency('kiwisolver', (('matplotlib>=2.2', 'kiwisolver'),))],
+    )
     mocker.patch('importlib.metadata.distribution', side_effect=importlib.metadata.PackageNotFoundError)
 
     build.__main__.build_package(package_test_flit, '.', ['sdist'], isolation=False)
@@ -371,6 +381,38 @@ def test_build_no_isolation_check_deps_chain_without_specifier(
     error.assert_called_once_with(
         f'Unmet dependencies (checked against {sys.executable}):'
         '\n\tmatplotlib>=2.2 -> kiwisolver\n\t\twanted: any\n\t\tfound: not installed'
+    )
+
+
+def test_build_no_isolation_check_deps_multiple_source_chains(
+    mocker: pytest_mock.MockerFixture, package_test_flit: str
+) -> None:
+    # A dependency pulled in by two parents is reported once with both source chains.
+    error = mocker.patch('build.__main__._error')
+    mocker.patch('build.ProjectBuilder.build', return_value='something')
+    mocker.patch(
+        'build.ProjectBuilder.check_dependencies',
+        return_value=[
+            build._util.UnmetDependency(
+                'shared-lib',
+                (
+                    ('parent_a', 'Shared_Lib'),
+                    ('parent_b', 'shared-lib'),
+                ),
+            )
+        ],
+    )
+    mocker.patch('importlib.metadata.distribution', side_effect=importlib.metadata.PackageNotFoundError)
+
+    build.__main__.build_package(package_test_flit, '.', ['sdist'], isolation=False)
+
+    error.assert_called_once_with(
+        f'Unmet dependencies (checked against {sys.executable}):'
+        '\n\tshared-lib'
+        '\n\t\trequired via: parent_a -> Shared_Lib'
+        '\n\t\trequired via: parent_b -> shared-lib'
+        '\n\t\twanted: any'
+        '\n\t\tfound: not installed'
     )
 
 

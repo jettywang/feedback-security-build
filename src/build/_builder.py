@@ -32,7 +32,7 @@ from ._exceptions import (
     BuildSystemTableValidationError,
     TypoWarning,
 )
-from ._util import check_dependency
+from ._util import UnmetDependency, check_dependency, collect_unmet_dependencies
 
 
 TYPE_CHECKING = False
@@ -285,18 +285,24 @@ class ProjectBuilder:
         self,
         distribution: Distribution,
         config_settings: ConfigSettings | None = None,
-    ) -> set[tuple[str, ...]]:
+    ) -> tuple[UnmetDependency, ...]:
         """
         Return the dependencies which are not satisfied from the combined set of
         :attr:`build_system_requires` and :meth:`get_requires_for_build` for a given
         distribution.
 
+        Chains reaching the same unsatisfied requirement are merged, so a
+        dependency referenced by several parent dependencies is reported once
+        with every source chain that pulls it in.
+
         :param distribution: Distribution to check (``sdist`` or ``wheel``)
         :param config_settings: Config settings for the build backend
-        :returns: Set of variable-length unmet dependency tuples
+        :returns: One record per unsatisfied requirement, each holding the
+            requirement's full source chains
         """
         dependencies = self.get_requires_for_build(distribution, config_settings).union(self.build_system_requires)
-        return {u for d in dependencies for u in check_dependency(d)}
+        chains = [chain for dependency in dependencies for chain in check_dependency(dependency)]
+        return collect_unmet_dependencies(chains)
 
     def prepare(
         self,
