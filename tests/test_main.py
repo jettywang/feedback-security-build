@@ -1489,6 +1489,82 @@ def test_outdir_not_allowed_with_metadata(capsys: pytest.CaptureFixture[str]) ->
     assert '--outdir: not allowed with --metadata' in capsys.readouterr().err
 
 
+def test_audit_dependencies_written(
+    mocker: pytest_mock.MockerFixture,
+    tmp_path: pathlib.Path,
+    package_test_deps_audit: str,
+) -> None:
+    isolated_env = mocker.patch('build.__main__.DefaultIsolatedEnv')
+    build_package = mocker.patch('build.__main__.build_package')
+    build_via_sdist = mocker.patch('build.__main__.build_package_via_sdist')
+    report = tmp_path / 'audit.json'
+
+    build.__main__.main([package_test_deps_audit, '--audit-dependencies', str(report)])
+
+    # audit mode never creates an isolated environment, installs or builds anything
+    isolated_env.assert_not_called()
+    build_package.assert_not_called()
+    build_via_sdist.assert_not_called()
+
+    payload = json.loads(report.read_text(encoding='utf-8'))
+    assert payload['version'] == '1.0'
+    assert len(payload['audits']) == 1
+    audit = payload['audits'][0]
+    assert audit['distribution'] == 'wheel'
+    assert audit['source_dir'] == package_test_deps_audit
+
+    static = audit['stages']['static']
+    assert static['requires_backend_hooks'] is False
+    assert {entry['requirement'] for entry in static['requirements']} == {'declared-dep', 'shared-dep>=1', 'this is invalid'}
+
+    backend = audit['stages']['backend']
+    assert backend['requires_backend_hooks'] is True
+    assert backend['hook'] == 'get_requires_for_build_wheel'
+    assert backend['error'] is None
+    assert {entry['requirement'] for entry in backend['requirements']} == {
+        'backend-dep',
+        'shared-dep>=2',
+        'not a requirement either',
+    }
+
+    invalid = [entry for stage in audit['stages'].values() for entry in stage['requirements'] if not entry['valid']]
+    assert {entry['requirement'] for entry in invalid} == {'this is invalid', 'not a requirement either'}
+    assert all(entry['error'] for entry in invalid)
+
+    assert audit['duplicates'] == [
+        {'name': 'shared-dep', 'occurrences': {'static': ['shared-dep>=1'], 'backend': ['shared-dep>=2']}}
+    ]
+
+
+def test_audit_dependencies_selected_distributions(
+    mocker: pytest_mock.MockerFixture,
+    tmp_path: pathlib.Path,
+    package_test_deps_audit: str,
+) -> None:
+    mocker.patch('build.__main__.DefaultIsolatedEnv')
+    report = tmp_path / 'audit.json'
+
+    build.__main__.main([package_test_deps_audit, '-s', '-w', '--audit-dependencies', str(report)])
+
+    payload = json.loads(report.read_text(encoding='utf-8'))
+    assert [audit['distribution'] for audit in payload['audits']] == ['sdist', 'wheel']
+
+
+@pytest.mark.parametrize(
+    ('cli_args', 'err_msg'),
+    [
+        (['--audit-dependencies', 'a.json', '--metadata'], '--audit-dependencies: not allowed with --metadata'),
+        (['--audit-dependencies', 'a.json', '--outdir', 'dist'], '--audit-dependencies: not allowed with --outdir'),
+        (['--audit-dependencies', 'a.json', '--report', 'r.json'], '--audit-dependencies: not allowed with --report'),
+    ],
+)
+def test_audit_dependencies_not_allowed(cli_args: list[str], err_msg: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        build.__main__.main(cli_args)
+
+    assert err_msg in capsys.readouterr().err
+
+
 @pytest.fixture
 def wheel(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / 'demo-1.0.0-py3-none-any.whl'

@@ -1,0 +1,4 @@
+[build-system]
+requires = ["declared-dep", "shared-dep>=1", "this is invalid"]
+build-backend = "backend"
+backend-path = ["."]

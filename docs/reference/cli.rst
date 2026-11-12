@@ -50,6 +50,71 @@ With ``--no-isolation``, build does not install anything; it checks that the bui
 the interpreter running build. An unmet requirement stops the build. Pass ``--skip-dependency-check`` to skip this
 check. See :ref:`unmet-dependencies` for how to interpret and resolve the error.
 
+.. _dependency-audit:
+
+*******************
+ Dependency Audit
+*******************
+
+``--audit-dependencies PATH`` writes a machine-readable JSON report of the build dependencies of the selected
+distributions (``--wheel`` by default; pass ``--sdist`` and/or ``--wheel`` to choose) to ``PATH`` and exits without
+building anything.
+
+.. code-block:: console
+
+    $ python -m build --wheel --audit-dependencies deps-audit.json
+
+The audit never creates an isolated environment and never installs anything, so it is safe to run in release
+automation before any build takes place. The write is atomic, like :ref:`build-report <build-report>`.
+
+The report splits requirements into two stages:
+
+- ``static``: requirements declared by the project in ``pyproject.toml``'s ``build-system.requires``. These are
+  read straight from the file; no backend code runs.
+- ``backend``: requirements the backend adds in the prepare phase. **This stage requires executing the backend's**
+  ``get_requires_for_build_<distribution>`` **hook** in the current environment, so the backend must be importable
+  there (installed, or shipped in-tree via ``backend-path``). If the hook cannot be run, the stage's ``error`` field
+  records the failure and its ``requirements`` list is empty; the ``static`` stage is still reported.
+
+Requirement strings that fail to parse are reported with ``"valid": false`` and the parse error instead of aborting
+the audit. Packages requested more than once — whether declared by both the project and the backend, or repeated
+within one stage — are listed under ``duplicates``.
+
+The schema is:
+
+.. code-block:: json
+
+    {
+      "version": "1.0",
+      "audits": [
+        {
+          "distribution": "wheel",
+          "source_dir": "/path/to/project",
+          "stages": {
+            "static": {
+              "description": "requirements declared by the project in pyproject.toml's build-system.requires",
+              "requires_backend_hooks": false,
+              "requirements": [
+                {"requirement": "setuptools>=68", "name": "setuptools", "valid": true, "error": null}
+              ]
+            },
+            "backend": {
+              "description": "requirements added by the backend via the get_requires_for_build_wheel hook",
+              "requires_backend_hooks": true,
+              "hook": "get_requires_for_build_wheel",
+              "error": null,
+              "requirements": [
+                {"requirement": "wheel", "name": "wheel", "valid": true, "error": null}
+              ]
+            }
+          },
+          "duplicates": []
+        }
+      ]
+    }
+
+The same report is available programmatically via :meth:`build.ProjectBuilder.audit_dependencies`.
+
 .. _build-verbosity:
 
 ****************

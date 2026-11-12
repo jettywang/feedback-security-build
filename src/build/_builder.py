@@ -32,7 +32,7 @@ from ._exceptions import (
     BuildSystemTableValidationError,
     TypoWarning,
 )
-from ._util import check_dependency
+from ._util import check_dependency, find_duplicate_requirements, inspect_requirement
 
 
 TYPE_CHECKING = False
@@ -42,12 +42,40 @@ if TYPE_CHECKING:
     from typing import NotRequired, Self, TypedDict, TypeGuard
 
     from ._types import ConfigSettings, Distribution, StrPath, SubprocessRunner, TOMLValue
+    from ._util import DuplicateRequirements, RequirementInfo
 
     # The validated ``[build-system]`` table.
     BuildSystemTable = TypedDict(
         'BuildSystemTable',
         {'requires': list[str], 'build-backend': str, 'backend-path': NotRequired[list[str]]},
     )
+
+    class StaticStageAudit(TypedDict):
+        """Audit of the requirements declared by the project itself."""
+
+        description: str
+        requires_backend_hooks: bool
+        requirements: list[RequirementInfo]
+
+    class BackendStageAudit(StaticStageAudit):
+        """Audit of the requirements added by the backend in the prepare phase."""
+
+        hook: str
+        error: str | None
+
+    class DependencyAuditStages(TypedDict):
+        """The two dependency stages of an audit report."""
+
+        static: StaticStageAudit
+        backend: BackendStageAudit
+
+    class DependencyAudit(TypedDict):
+        """Machine-readable, staged report of a distribution's build dependencies."""
+
+        distribution: str
+        source_dir: str
+        stages: DependencyAuditStages
+        duplicates: list[DuplicateRequirements]
 
 
 _DEFAULT_BACKEND: BuildSystemTable = {
@@ -297,6 +325,64 @@ class ProjectBuilder:
         """
         dependencies = self.get_requires_for_build(distribution, config_settings).union(self.build_system_requires)
         return {u for d in dependencies for u in check_dependency(d)}
+
+    def audit_dependencies(
+        self,
+        distribution: Distribution,
+        config_settings: ConfigSettings | None = None,
+    ) -> DependencyAudit:
+        """
+        Describe the build dependencies of a distribution as a machine-readable,
+        staged report, without installing anything.
+
+        The report has two stages:
+
+        - ``static``: the requirements declared by the project in
+          ``pyproject.toml``'s ``build-system.requires``. These are available
+          without running the backend.
+        - ``backend``: the requirements the backend adds in the prepare phase.
+          This stage **requires executing the backend's
+          ``get_requires_for_build_<distribution>`` hook**; if the backend
+          cannot be run, the stage's ``error`` field describes the failure and
+          its ``requirements`` list is empty.
+
+        Requirement strings that fail to parse are reported with ``valid`` set
+        to :data:`False` and the parse error, instead of raising. Packages
+        requested more than once across the stages are listed under
+        ``duplicates``.
+
+        :param distribution: Distribution to audit (``sdist`` or ``wheel``)
+        :param config_settings: Config settings for the build backend
+        :returns: The dependency audit report
+        """
+        hook_name = f'get_requires_for_build_{distribution}'
+        static_requirements = [inspect_requirement(req) for req in sorted(self.build_system_requires)]
+        backend_error = None
+        try:
+            backend_requires = self.get_requires_for_build(distribution, config_settings)
+        except BuildBackendException as e:
+            backend_requires = set()
+            backend_error = str(e)
+        backend_requirements = [inspect_requirement(req) for req in sorted(backend_requires)]
+        return {
+            'distribution': distribution,
+            'source_dir': self._source_dir,
+            'stages': {
+                'static': {
+                    'description': "requirements declared by the project in pyproject.toml's build-system.requires",
+                    'requires_backend_hooks': False,
+                    'requirements': static_requirements,
+                },
+                'backend': {
+                    'description': f'requirements added by the backend via the {hook_name} hook',
+                    'requires_backend_hooks': True,
+                    'hook': hook_name,
+                    'error': backend_error,
+                    'requirements': backend_requirements,
+                },
+            },
+            'duplicates': find_duplicate_requirements({'static': static_requirements, 'backend': backend_requirements}),
+        }
 
     def prepare(
         self,

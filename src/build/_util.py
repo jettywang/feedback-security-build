@@ -1,19 +1,35 @@
 from __future__ import annotations
 
 
-__lazy_modules__ = {'importlib.metadata', 'packaging.requirements'}
+__lazy_modules__ = {'importlib.metadata', 'packaging.requirements', 'packaging.utils'}
 
 import importlib.metadata
 import sys
 
 import packaging.requirements
+import packaging.utils
 
 
 TYPE_CHECKING = False
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator
+    from collections.abc import Generator, Iterator, Mapping, Sequence
     from collections.abc import Set as AbstractSet
+    from typing import TypedDict
+
+    class RequirementInfo(TypedDict):
+        """Machine-readable description of a single requirement string."""
+
+        requirement: str
+        name: str | None
+        valid: bool
+        error: str | None
+
+    class DuplicateRequirements(TypedDict):
+        """Requirements for the same package requested more than once across audit stages."""
+
+        name: str
+        occurrences: dict[str, list[str]]
 
 
 def check_dependency(
@@ -80,6 +96,48 @@ def _check_dependency(
     if satisfied:
         seen.add(normalised_req_string)
     return satisfied
+
+
+def inspect_requirement(req_string: str) -> RequirementInfo:
+    """
+    Describe a requirement string for auditing purposes, capturing parse
+    failures instead of raising them.
+
+    :param req_string: Requirement string
+    :returns: Mapping with the original string, the canonicalized package name
+        (``None`` when the string cannot be parsed), a validity flag and the
+        parse error message (``None`` when valid)
+    """
+    try:
+        req = packaging.requirements.Requirement(req_string)
+    except packaging.requirements.InvalidRequirement as e:
+        return {'requirement': req_string, 'name': None, 'valid': False, 'error': str(e)}
+    return {
+        'requirement': req_string,
+        'name': str(packaging.utils.canonicalize_name(req.name)),
+        'valid': True,
+        'error': None,
+    }
+
+
+def find_duplicate_requirements(stage_requirements: Mapping[str, Sequence[RequirementInfo]]) -> list[DuplicateRequirements]:
+    """
+    Find packages whose requirements appear more than once across audit stages.
+
+    :param stage_requirements: Mapping of stage name to the stage's inspected requirements
+    :returns: One entry per package requested more than once in total, listing the
+        requirement strings per stage; unparseable requirements are ignored
+    """
+    by_name: dict[str, dict[str, list[str]]] = {}
+    for stage, entries in stage_requirements.items():
+        for entry in entries:
+            if entry['name'] is not None:
+                by_name.setdefault(entry['name'], {}).setdefault(stage, []).append(entry['requirement'])
+    return [
+        {'name': name, 'occurrences': occurrences}
+        for name, occurrences in sorted(by_name.items())
+        if sum(len(requirements) for requirements in occurrences.values()) > 1
+    ]
 
 
 def format_unmet_dependencies(unmet: AbstractSet[tuple[str, ...]]) -> str:

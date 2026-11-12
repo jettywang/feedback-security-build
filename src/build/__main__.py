@@ -65,6 +65,7 @@ TYPE_CHECKING = False
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
 
+    from build._builder import DependencyAudit
     from build._types import ConfigSettings, Distribution, JSONValue, StrPath, SubprocessRunner
 
 
@@ -85,6 +86,7 @@ class _CliArgs:
     sdist_extract_dir: str | None
     env_dir: str | None
     report: str | None
+    audit_dependencies: str | None
 
 
 _COLORS = {
@@ -615,6 +617,15 @@ def main_parser() -> argparse.ArgumentParser:
         'to this path. Cannot be used together with ``--metadata``',
         metavar='PATH',
     )
+    build_group.add_argument(
+        '--audit-dependencies',
+        help='write a machine-readable JSON report of the build dependencies of the selected distributions '
+        '(wheel by default) to this path and exit without building. The report splits requirements by stage: '
+        'declared by the project in ``build-system.requires`` vs. added by the backend, which requires running '
+        'backend hooks. Nothing is installed; hooks run in the current environment. '
+        'Cannot be used together with ``--metadata``, ``--outdir`` or ``--report``',
+        metavar='PATH',
+    )
     config_exclusive_group = build_group.add_mutually_exclusive_group()
     config_exclusive_group.add_argument(
         '--config-setting',
@@ -732,6 +743,9 @@ def main(cli_args: Sequence[str], prog: str | None = None) -> None:
         outdir = os.path.join(args.srcdir, 'dist')
 
     with _handle_build_error(env_dir=args.env_dir, sdist_extract_dir=args.sdist_extract_dir):
+        if args.audit_dependencies is not None:
+            _audit_dependencies_cli(parser, args, sdist_input=sdist_input)
+            return
         if sdist_input:
             with _extract_sdist(args.srcdir, extract_dir=args.sdist_extract_dir) as extracted_srcdir:
                 built = run_build(extracted_srcdir, outdir)
@@ -759,24 +773,66 @@ class _BuildReport(TypedDict):
     artifacts: list[_ArtifactReport]
 
 
-def _write_report(path: StrPath, outdir: StrPath, artifacts: Sequence[str]) -> None:
-    report: _BuildReport = {
-        'version': '1.0',
-        'artifacts': [_describe_artifact(os.path.abspath(os.path.join(outdir, name)), name) for name in artifacts],
-    }
-    data = json.dumps(report, indent=2) + '\n'
+class _DependencyAuditReport(TypedDict):
+    version: str
+    audits: list[DependencyAudit]
+
+
+def _audit_dependencies_cli(parser: argparse.ArgumentParser, args: _CliArgs, *, sdist_input: bool) -> None:
+    if args.metadata:
+        parser.error('--audit-dependencies: not allowed with --metadata')
+    if args.outdir is not None:
+        parser.error('--audit-dependencies: not allowed with --outdir')
+    if args.report is not None:
+        parser.error('--audit-dependencies: not allowed with --report')
+    assert args.audit_dependencies is not None  # guaranteed by the caller
+
+    distributions: list[Distribution] = args.distributions or ['wheel']
+    config_settings = _resolve_config_settings(args)
+    if sdist_input:
+        with _extract_sdist(args.srcdir, extract_dir=args.sdist_extract_dir) as extracted_srcdir:
+            audits = _audit_dependencies(extracted_srcdir, distributions, config_settings)
+    else:
+        audits = _audit_dependencies(args.srcdir, distributions, config_settings)
+    report: _DependencyAuditReport = {'version': '1.0', 'audits': audits}
+    _write_json(args.audit_dependencies, report)
+    _ctx.log(f'Wrote dependency audit report to {args.audit_dependencies}', kind=('step',))
+
+
+def _audit_dependencies(
+    srcdir: StrPath,
+    distributions: Sequence[Distribution],
+    config_settings: ConfigSettings | None,
+) -> list[DependencyAudit]:
+    # The audit never creates an isolated environment and never installs
+    # anything: backend hooks run in the current environment.
+    runner = pyproject_hooks.quiet_subprocess_runner if _ctx.verbosity < 0 else pyproject_hooks.default_subprocess_runner
+    builder = ProjectBuilder(srcdir, runner=runner)
+    return [builder.audit_dependencies(distribution, config_settings) for distribution in distributions]
+
+
+def _write_json(path: StrPath, data: object) -> None:
+    text = json.dumps(data, indent=2) + '\n'
 
     report_dir = os.path.dirname(os.path.abspath(path))
     os.makedirs(report_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=report_dir, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as report_file:
-            report_file.write(data)
+            report_file.write(text)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def _write_report(path: StrPath, outdir: StrPath, artifacts: Sequence[str]) -> None:
+    report: _BuildReport = {
+        'version': '1.0',
+        'artifacts': [_describe_artifact(os.path.abspath(os.path.join(outdir, name)), name) for name in artifacts],
+    }
+    _write_json(path, report)
 
 
 def _describe_artifact(path: str, name: str) -> _ArtifactReport:

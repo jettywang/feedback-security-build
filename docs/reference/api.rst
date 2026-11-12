@@ -86,6 +86,21 @@ Accessing build dependencies:
     wheel_requires = builder.get_requires_for_build("wheel")
     print(f"Wheel build requires: {wheel_requires}")
 
+Auditing build dependencies without building:
+
+:meth:`~build.ProjectBuilder.audit_dependencies` returns a machine-readable, staged report of the build
+dependencies — declared by the project vs. added by the backend — without installing anything. Only the ``backend``
+stage executes a backend hook; see :ref:`dependency-audit` for the report schema.
+
+.. code-block:: python
+
+    from build import ProjectBuilder
+
+    builder = ProjectBuilder(".")
+    audit = builder.audit_dependencies("wheel")
+    print(audit["stages"]["static"]["requirements"])  # build-system.requires
+    print(audit["stages"]["backend"]["requirements"])  # added by the backend hook
+
 Handling errors:
 
 .. code-block:: python

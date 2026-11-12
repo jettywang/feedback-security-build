@@ -382,6 +382,79 @@ def test_check_dependencies(
         not builder.check_dependencies('wheel')
 
 
+def test_audit_dependencies_reports_static_and_backend_stages(package_test_deps_audit: str) -> None:
+    builder = build.ProjectBuilder(package_test_deps_audit)
+
+    audit = builder.audit_dependencies('wheel')
+
+    assert audit['distribution'] == 'wheel'
+    assert audit['source_dir'] == package_test_deps_audit
+
+    static = audit['stages']['static']
+    assert static['requires_backend_hooks'] is False
+    assert {entry['requirement'] for entry in static['requirements']} == {'declared-dep', 'shared-dep>=1', 'this is invalid'}
+
+    backend = audit['stages']['backend']
+    assert backend['requires_backend_hooks'] is True
+    assert backend['hook'] == 'get_requires_for_build_wheel'
+    assert backend['error'] is None
+    assert {entry['requirement'] for entry in backend['requirements']} == {
+        'backend-dep',
+        'shared-dep>=2',
+        'not a requirement either',
+    }
+
+
+def test_audit_dependencies_invalid_requirements_are_reported_not_raised(package_test_deps_audit: str) -> None:
+    builder = build.ProjectBuilder(package_test_deps_audit)
+
+    audit = builder.audit_dependencies('wheel')
+
+    entries = [entry for stage in audit['stages'].values() for entry in stage['requirements']]
+    invalid = {entry['requirement']: entry for entry in entries if not entry['valid']}
+    assert set(invalid) == {'this is invalid', 'not a requirement either'}
+    for entry in invalid.values():
+        assert entry['name'] is None
+        assert entry['error']
+    for entry in entries:
+        if entry['valid']:
+            assert entry['error'] is None
+
+
+def test_audit_dependencies_reports_duplicate_requirements(package_test_deps_audit: str) -> None:
+    builder = build.ProjectBuilder(package_test_deps_audit)
+
+    audit = builder.audit_dependencies('wheel')
+
+    assert audit['duplicates'] == [
+        {'name': 'shared-dep', 'occurrences': {'static': ['shared-dep>=1'], 'backend': ['shared-dep>=2']}}
+    ]
+
+
+def test_audit_dependencies_backend_unavailable_is_recorded(package_test_bad_backend: str) -> None:
+    builder = build.ProjectBuilder(package_test_bad_backend)
+
+    audit = builder.audit_dependencies('wheel')
+
+    backend = audit['stages']['backend']
+    assert backend['error'] is not None
+    assert backend['requirements'] == []
+    # the static stage does not need the backend and is still reported
+    assert audit['stages']['static']['requirements'] == []
+    assert audit['stages']['static']['requires_backend_hooks'] is False
+
+
+def test_audit_dependencies_sdist_uses_sdist_hook(package_test_deps_audit: str) -> None:
+    builder = build.ProjectBuilder(package_test_deps_audit)
+
+    audit = builder.audit_dependencies('sdist')
+
+    backend = audit['stages']['backend']
+    assert backend['hook'] == 'get_requires_for_build_sdist'
+    assert [entry['requirement'] for entry in backend['requirements']] == ['backend-dep']
+    assert audit['duplicates'] == []
+
+
 def test_build(mocker: pytest_mock.MockerFixture, package_test_flit: str, tmp_dir: str) -> None:
     hook = mocker.patch('pyproject_hooks.BuildBackendHookCaller', autospec=True).return_value
 
